@@ -81,6 +81,18 @@ use_api
   Seleziona dati di un'API già intercettata. Value = URL o URL→path per sub-array.
   {"type":"use_api","value":"https://api.sito.it/games"}
 
+fetch_merge
+  Fetcha una seconda API e unisce i dati (es: URL) al catalogo già caricato. Serve per arricchire il catalogo con link, slug SEO, ecc.
+  {"type":"fetch_merge","value":"https://sito.it/api/seodata","joinKey":"chiaveGioco","urlPrefix":"https://sito.it/slots/","extractPath":"gamesUrlPreview"}
+  joinKey: campo nel catalogo per fare il match
+  urlPrefix: prefisso da aggiungere allo slug per costruire URL completo
+  extractPath: percorso nell'oggetto JSON per trovare la mappa di URL (es: "gamesUrlPreview")
+  Il risultato aggiunge campo "url" a ogni gioco che ha un match.
+
+run
+  Esegue codice JS arbitrario con accesso ai dati. Variabili disponibili: CATALOG (array giochi), APIS (dati API salvati), SAMPLES (campioni API). Assegna il risultato a RESULT.
+  {"type":"run","value":"var count = CATALOG.filter(g => g.url).length; RESULT = 'Giochi con URL: ' + count"}
+
 download
   Scarica i dati selezionati come file JSON.
   {"type":"download","filename":"sito_catalog.json"}
@@ -109,7 +121,9 @@ STRATEGIA
 7. MAI scaricare senza verificare che i dati contengano nomi giochi reali
 8. MAI ripetere un'azione già fatta
 9. Preferisci SEMPRE JSON da API rispetto a scrape DOM
-10. Rispondi SEMPRE e SOLO col JSON, max 15 parole nel reasoning`;
+10. PRIMA di scaricare, cerca API con URL/slug SEO (tipo /seodata, /seo, /urls) e usa fetch_merge per aggiungere i link al catalogo
+11. Un catalogo completo ha: nome, provider, immagine, URL pagina gioco. Se mancano gli URL, cercali!
+12. Rispondi SEMPRE e SOLO col JSON, max 15 parole nel reasoning`;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  SESSION — conversazione con Claude per ogni host
