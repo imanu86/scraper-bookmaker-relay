@@ -15,15 +15,16 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, maxPayload: 1024 * 1024 }); // 1MB
 
 // ─── State ───
-let agent = null;   // WS del TM agent (su bookmaker)
-let bridge = null;  // WS del TM bridge (su claude.ai)
+let agents = new Set();  // tutti gli agent connessi
+let activeAgent = null;  // l'agent che ha chiesto aiuto (riceve la risposta)
+let bridge = null;
 
 // ─── Health endpoint ───
 app.get('/', (req, res) => {
     res.json({
         status: 'ok',
         service: 'scraper-bookmaker-relay',
-        agent: agent ? 'connected' : 'disconnected',
+        agent: agents.size + ' connected' + (activeAgent ? ' (1 active)' : ''),
         bridge: bridge ? 'connected' : 'disconnected',
         uptime: Math.round(process.uptime()) + 's'
     });
@@ -44,11 +45,10 @@ wss.on('connection', (ws, req) => {
             // Registrazione ruolo
             if (msg.type === 'register') {
                 if (msg.role === 'agent') {
-                    agent = ws;
+                    agents.add(ws);
                     ws._role = 'agent';
-                    console.log('[agent] Registrato');
+                    console.log(`[agent] Registrato (${agents.size} totali)`);
                     ws.send(JSON.stringify({ type: 'registered', role: 'agent', bridge: bridge ? 'online' : 'offline' }));
-                    // Notifica bridge
                     if (bridge && bridge.readyState === 1) {
                         bridge.send(JSON.stringify({ type: 'agent_status', status: 'connected' }));
                     }
@@ -56,17 +56,17 @@ wss.on('connection', (ws, req) => {
                     bridge = ws;
                     ws._role = 'bridge';
                     console.log('[bridge] Registrato');
-                    ws.send(JSON.stringify({ type: 'registered', role: 'bridge', agent: agent ? 'online' : 'offline' }));
-                    // Notifica agent
-                    if (agent && agent.readyState === 1) {
-                        agent.send(JSON.stringify({ type: 'bridge_status', status: 'connected' }));
-                    }
+                    ws.send(JSON.stringify({ type: 'registered', role: 'bridge', agent: agents.size > 0 ? 'online' : 'offline' }));
+                    agents.forEach(a => {
+                        if (a.readyState === 1) a.send(JSON.stringify({ type: 'bridge_status', status: 'connected' }));
+                    });
                 }
                 return;
             }
 
-            // Forward: agent → bridge
+            // Forward: agent → bridge (salva chi ha chiesto)
             if (ws._role === 'agent' && msg.type === 'need_help') {
+                activeAgent = ws;  // QUESTO agent riceverà la risposta
                 console.log(`[agent→bridge] need_help (${JSON.stringify(msg).length}B)`);
                 if (bridge && bridge.readyState === 1) {
                     bridge.send(JSON.stringify(msg));
@@ -76,13 +76,14 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
-            // Forward: bridge → agent
+            // Forward: bridge → agent ATTIVO (quello che ha chiesto)
             if (ws._role === 'bridge' && msg.type === 'action') {
                 console.log(`[bridge→agent] action: ${msg.action?.type || '?'}`);
-                if (agent && agent.readyState === 1) {
-                    agent.send(JSON.stringify(msg));
+                if (activeAgent && activeAgent.readyState === 1) {
+                    activeAgent.send(JSON.stringify(msg));
+                    console.log('[bridge→agent] Inviato all\'agent attivo');
                 } else {
-                    ws.send(JSON.stringify({ type: 'error', message: 'Agent non connesso' }));
+                    ws.send(JSON.stringify({ type: 'error', message: 'Agent attivo non connesso' }));
                 }
                 return;
             }
@@ -102,15 +103,17 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', () => {
         console.log(`[-] ${ws._role || '?'} disconnesso`);
-        if (ws === agent) {
-            agent = null;
+        if (ws._role === 'agent') {
+            agents.delete(ws);
+            if (ws === activeAgent) activeAgent = null;
             if (bridge && bridge.readyState === 1)
-                bridge.send(JSON.stringify({ type: 'agent_status', status: 'disconnected' }));
+                bridge.send(JSON.stringify({ type: 'agent_status', status: agents.size + ' connected' }));
         }
         if (ws === bridge) {
             bridge = null;
-            if (agent && agent.readyState === 1)
-                agent.send(JSON.stringify({ type: 'bridge_status', status: 'disconnected' }));
+            agents.forEach(a => {
+                if (a.readyState === 1) a.send(JSON.stringify({ type: 'bridge_status', status: 'disconnected' }));
+            });
         }
     });
 });
