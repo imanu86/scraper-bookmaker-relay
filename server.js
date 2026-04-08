@@ -108,8 +108,12 @@ download
   {"type":"download","filename":"sito_catalog.json"}
 
 save_section
-  Salva il catalogo corrente con un'etichetta. I dati persistono anche dopo navigazione. Dopo il salvataggio i dati correnti vengono resettati, pronto per la prossima sezione.
-  {"type":"save_section","value":"slots"}
+  RICHIEDE il salvataggio del catalogo corrente. Lo script VALIDA i dati automaticamente (controlla che siano giochi casino, non sport/bingo) e ti chiede conferma con un campione. Se i dati sono OK rispondi con confirm_save, altrimenti retry_different.
+  {"type":"save_section","value":"casino"}
+
+confirm_save
+  Conferma il salvataggio dopo che la validazione è OK. Usa lo stesso nome della sezione.
+  {"type":"confirm_save","value":"casino"}
 
 download_all
   Unisce TUTTE le sezioni salvate (deduplicando) e scarica un unico file completo.
@@ -128,26 +132,48 @@ done
   {"type":"done"}
 
 ════════════════════════════════════════
+COSA CERCHIAMO (e cosa NO)
+════════════════════════════════════════
+CERCHIAMO SOLO:
+- Slot machine / slot online
+- Giochi da casino (roulette, blackjack, baccarat, poker da casino)
+- Casino live / live casino (tavoli con croupier dal vivo)
+- Game show live (Crazy Time, Monopoly Live, ecc.)
+
+NON CERCHIAMO (IGNORA queste sezioni):
+- Scommesse sportive / sport / virtual sport
+- Bingo / bingo live
+- Poker online (tornei, cash game)
+- Lotterie (Lotto, Gratta e Vinci, 10eLotto)
+- Carte (Scopa, Briscola, Burraco)
+- Ippica / corse
+
+Se navighi e finisci su una pagina bingo/sport/poker → FERMATI, torna indietro, non estrarre quei dati.
+Se un'API contiene dati sportivi (campi: ds, disciplina, quota, match, squadra) → IGNORA.
+Se i nomi sembrano "BI_BINGO01" o "PSG - Liverpool" → NON sono giochi casino.
+
+════════════════════════════════════════
 STRATEGIA
 ════════════════════════════════════════
 FASE 1 — MAPPATURA SEZIONI
-- Prima di tutto, guarda i link di navigazione per capire quali sezioni ha il sito (slot, casino, casino-live, ecc.)
-- Non tutti i siti hanno le stesse sezioni! Alcuni hanno slot separate, altri le includono nel casino
-- Identifica le sezioni reali del sito dai link nel menu (es: /slots, /casino, /livecasino, /casino-live)
-- Le API spesso hanno system_code nel URL che indica la sezione (es: SITO_SLOT, SITO_LIVE, SITO_CASINO)
+- Guarda i link di navigazione per capire quali sezioni CASINO ha il sito
+- Sezioni valide: /slots, /casino, /livecasino, /casino-live, /live-casino
+- Sezioni da IGNORARE: /sport, /bingo, /poker, /lotterie, /carte, /ippica, /virtual
+- Non tutti i siti hanno le stesse sezioni! Su alcuni le slot sono dentro /casino
+- Le API spesso hanno system_code nel URL (SITO_SLOT, SITO_LIVE, SITO_CASINO)
 
 FASE 2 — ESTRAZIONE PER SEZIONE
-- Per ogni sezione: naviga → intercetta API → analizza campioni → estrai dati → fetch_merge URL → verify_urls → save_section
-- Se un'API ha campi come name/title/provider/image in un array → è probabilmente il catalogo
-- API grossa non-JSON (HTML) → potrebbe avere dati JS inline → scan_js poi eval_js
-- API con system_code tipo XXXXX_LIVE o XXXXX_SLOT → probabilmente catalogo di quella sezione
-- ATTENZIONE: su alcuni siti le slot sono dentro la sezione casino (non c'è una pagina /slots separata). Se navighi a /casino e trovi 3000+ giochi con nomi tipo slot, le slot sono lì. NON cercare una sezione slot separata se non esiste nei link.
+- Per ogni sezione casino: naviga → intercetta API → analizza campioni → estrai → fetch_merge URL → verify_urls → save_section
+- PRIMA di save_section, VERIFICA i dati: guarda il campione. I giochi devono avere nomi tipo "Book of Ra", "Lightning Roulette", "Crazy Time" — NON "PSG-Liverpool" o "BI_BINGO01"
+- Se il campione sembra sospetto (nomi con squadre, codici bingo, quote) → NON salvare, cerca altrove
+- API con system_code tipo XXXXX_LIVE → catalogo live casino (NON bingo live!)
+- Su alcuni siti le slot sono dentro casino → se /casino ha 3000+ giochi con nomi di slot, le slot sono lì
 
 FASE 3 — VERIFICA COMPLETEZZA
-- Dopo ogni save_section, confronta il numero di giochi con le API intercettate e le immagini nel DOM
-- Se il sito mostra "Tutti (365)" o simile nel DOM e tu hai 365 giochi → sezione completa
-- Se hai estratto molto meno di quello che il sito dice di avere → cerca API paginata o scroll
-- Prima di download_all, verifica che tutte le sezioni identificate in FASE 1 siano state salvate
+- Dopo save_section, confronta i conteggi: se il DOM dice "Tutti (365)" e hai 365 → OK
+- Se hai molto meno → cerca API paginata o scroll
+- Prima di download_all, verifica che TUTTE le sezioni casino siano state salvate
+- Il risultato finale deve avere giochi di casino REALI con: nome, provider, URL
 
 REGOLE
 1. Guarda le API intercettate — array con name/title/provider = catalogo
@@ -156,11 +182,11 @@ REGOLE
 4. Dopo navigate senza API → scroll per lazy load
 5. Endpoint sospetto → fetch_api
 6. scrape_dom solo come ultima risorsa
-7. MAI scaricare senza verificare che i dati contengano nomi giochi reali
+7. MAI scaricare senza verificare che i dati siano GIOCHI CASINO reali
 8. MAI ripetere un'azione già fatta
 9. Preferisci SEMPRE JSON da API rispetto a scrape DOM
-10. DOPO fetch_merge, usa SEMPRE verify_urls per testare che gli URL funzionino
-11. Se verify_urls mostra 404, usa fix_urls per correggere il prefisso
+10. DOPO fetch_merge, usa SEMPRE verify_urls per testare gli URL
+11. Se verify_urls dà 404, usa fix_urls per correggere il prefisso
 12. Rispondi SEMPRE e SOLO col JSON, max 15 parole nel reasoning`;
 
 // ═══════════════════════════════════════════════════════════════════════
