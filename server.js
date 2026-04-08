@@ -409,8 +409,8 @@ async function askClaude(host, userMessage, retryCount) {
             session.messages.pop();
         }
 
-        // Retry su 429 (rate limit)
-        if (e.message.includes('429') && retryCount < 3) {
+        // Retry su 429 (rate limit) e 529 (overloaded)
+        if ((e.message.includes('429') || e.message.includes('529')) && retryCount < 3) {
             const waitSec = 15 * (retryCount + 1); // 15s, 30s, 45s
             console.log(`[${host}] 🔄 Retry #${retryCount + 1} tra ${waitSec}s...`);
             await new Promise(r => setTimeout(r, waitSec * 1000));
