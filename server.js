@@ -89,6 +89,16 @@ fetch_merge
   extractPath: percorso nell'oggetto JSON per trovare la mappa di URL (es: "gamesUrlPreview")
   Il risultato aggiunge campo "url" a ogni gioco che ha un match.
 
+verify_urls
+  Testa N URL dal catalogo (HEAD request) per verificare che funzionino (200 OK).
+  {"type":"verify_urls","value":"3"}
+  Restituisce quanti funzionano e quali no. Usa SEMPRE dopo fetch_merge per controllare.
+
+fix_urls
+  Corregge gli URL nel catalogo: sostituisce un prefisso con un altro.
+  {"type":"fix_urls","value":"https://sito.it/slots/","oldPrefix":"https://sito.it/"}
+  Utile se verify_urls mostra che gli URL hanno il prefisso sbagliato.
+
 run
   Esegue codice JS arbitrario con accesso ai dati. Variabili disponibili: CATALOG (array giochi), APIS (dati API salvati), SAMPLES (campioni API). Assegna il risultato a RESULT.
   {"type":"run","value":"var count = CATALOG.filter(g => g.url).length; RESULT = 'Giochi con URL: ' + count"}
@@ -130,9 +140,11 @@ STRATEGIA
 8. MAI ripetere un'azione già fatta
 9. Preferisci SEMPRE JSON da API rispetto a scrape DOM
 10. PRIMA di scaricare, cerca API con URL/slug SEO e usa fetch_merge per aggiungere i link
-11. ESPLORA TUTTE LE SEZIONI: dopo aver completato slot, usa save_section per salvare, poi naviga a casino, poi casino live. Alla fine usa download_all per unire tutto
-12. Flusso multi-sezione: estrai slot → fetch_merge URL → save_section "slots" → navigate /casino → estrai → fetch_merge → save_section "casino" → navigate /casino-live → estrai → save_section "casino_live" → download_all
-13. Rispondi SEMPRE e SOLO col JSON, max 15 parole nel reasoning`;
+11. DOPO fetch_merge, usa SEMPRE verify_urls per testare che gli URL funzionino. Se non funzionano, usa fix_urls per correggere il prefisso
+12. ESPLORA TUTTE LE SEZIONI: slot, casino, casino live. Per ogni sezione: estrai catalogo → fetch_merge URL → verify_urls → fix_urls se necessario → save_section
+13. Flusso per sezione: eval_js/use_api → fetch_merge (SEO URLs) → verify_urls 3 → se KO fix_urls → save_section → navigate alla prossima
+14. Alla fine: download_all per unire tutto
+15. Rispondi SEMPRE e SOLO col JSON, max 15 parole nel reasoning`;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  SESSION — conversazione con Claude per ogni host
