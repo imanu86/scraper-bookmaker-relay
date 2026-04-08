@@ -17,9 +17,11 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, maxPayload: 2 * 1024 * 1024 });
 
 const API_KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514';
+const MODEL = 'claude-sonnet-4-20250514';
 
-if (!API_KEY) console.warn('⚠️  ANTHROPIC_API_KEY non impostata! Claude API non funzionerà.');
+if (!API_KEY) console.warn('⚠️  ANTHROPIC_API_KEY non impostata!');
+
+function pickModel() { return MODEL; }
 
 let agents = new Set();
 
@@ -339,10 +341,13 @@ async function askClaude(host, userMessage, retryCount) {
 
     console.log(`[${host}] 🤖 Claude ask #${session.asks} (~${estimatedTokens} tokens, ${session.messages.length} msgs)`);
 
+    // Scegli modello
+    const model = pickModel(userMessage, session);
+
     try {
         const currentPrompt = buildSystemPrompt();
         const body = JSON.stringify({
-            model: MODEL,
+            model: model,
             max_tokens: 300,
             system: [{ type: 'text', text: currentPrompt, cache_control: { type: 'ephemeral' } }],
             messages: apiMessages,
@@ -392,8 +397,9 @@ async function askClaude(host, userMessage, retryCount) {
 
         session.messages.push({ role: 'assistant', content: text });
         const cached = result.usage?.cache_read_input_tokens ? ` (${result.usage.cache_read_input_tokens} cached)` : '';
-        console.log(`[${host}] ✅ Claude: ${text.substring(0, 100)}${cached}`);
-        return { text };
+        const modelShort = model.includes('sonnet') ? '🧠S' : '⚡H';
+        console.log(`[${host}] ✅ ${modelShort} Claude: ${text.substring(0, 100)}${cached}`);
+        return { text, model, modelShort };
 
     } catch (e) {
         console.error(`[${host}] ❌ ${e.message}`);
@@ -621,9 +627,10 @@ async function handleNeedHelp(agentWs, msg) {
     }
 
     // Invia azione all'agent
+    const tag = response.modelShort || '?';
     agentWs.send(JSON.stringify({
         type: 'action',
-        reasoning: '[CLAUDE] ' + (parsed.reasoning || ''),
+        reasoning: '['+tag+'] ' + (parsed.reasoning || ''),
         action: parsed.action
     }));
 }
