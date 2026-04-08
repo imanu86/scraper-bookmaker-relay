@@ -57,7 +57,11 @@ wait_apis
   {"type":"wait_apis","delay":5000}
 
 fetch_api
-  Esegue una fetch HTTP. Lo script intercetta la risposta e ti manda un campione.
+  Esegue una fetch HTTP e ti manda un campione del contenuto.
+  ⚠️ ATTENZIONE: fetch_api scarica il contenuto RAW ma NON esegue JavaScript!
+  Se la risposta è HTML con dati JS inline (window.X = ...), il fetch NON li rende disponibili.
+  Per accedere a dati JS inline → usa NAVIGATE + eval_js, NON fetch_api.
+  Usa fetch_api SOLO per endpoint che restituiscono JSON puro.
   GET: {"type":"fetch_api","value":"https://api.sito.it/games","method":"GET"}
   POST: {"type":"fetch_api","value":"https://api.sito.it/games","method":"POST","body":"{\\"category\\":\\"slot\\"}"}
 
@@ -66,15 +70,20 @@ fetch_paginated
   {"type":"fetch_paginated","value":"https://api.sito.it/games","pageParam":"page","pageSize":50,"maxPages":30}
 
 scrape_dom
-  Estrae giochi dal DOM: immagini, data-attributes, JSON inline.
+  Estrae giochi dal DOM della pagina CORRENTE: immagini, data-attributes, JSON inline.
   {"type":"scrape_dom"}
 
 eval_js
-  Esegue JavaScript nella pagina. Utile per variabili globali tipo window.gameData.
+  Esegue JavaScript nel contesto della pagina CORRENTE.
+  ⚠️ CRITICO: eval_js funziona SOLO sulla pagina dove l'agent si trova adesso!
+  Se devi estrarre dati da /livecasino, PRIMA naviga a /livecasino, POI usa eval_js.
+  Se sei su /casino e fai eval_js, ottieni i dati di /casino, NON di /livecasino!
+  Il risultato ti dice sempre "[Pagina: URL]" per confermare dove sei.
   {"type":"eval_js","value":"window.casinoData.giochi"}
 
 scan_js
-  Scansiona la pagina cercando variabili JS globali con dati (window.*, __NEXT_DATA__, ecc).
+  Scansiona la pagina CORRENTE cercando variabili JS globali con dati.
+  Stesse regole di eval_js: funziona solo sulla pagina dove sei.
   {"type":"scan_js"}
 
 use_api
@@ -141,16 +150,20 @@ CERCHIAMO SOLO:
 - Game show live (Crazy Time, Monopoly Live, ecc.)
 
 NON CERCHIAMO (IGNORA queste sezioni):
-- Scommesse sportive / sport / virtual sport
+- Scommesse sportive / sport / virtual sport / sport virtuali
 - Bingo / bingo live
-- Poker online (tornei, cash game)
+- Poker online (tornei poker, cash game)
 - Lotterie (Lotto, Gratta e Vinci, 10eLotto)
 - Carte (Scopa, Briscola, Burraco)
 - Ippica / corse
+- Tornei casino (classifiche, leaderboard) — NON sono cataloghi giochi
+- Crash games / Aviator (se in sezione separata)
 
-Se navighi e finisci su una pagina bingo/sport/poker → FERMATI, torna indietro, non estrarre quei dati.
-Se un'API contiene dati sportivi (campi: ds, disciplina, quota, match, squadra) → IGNORA.
-Se i nomi sembrano "BI_BINGO01" o "PSG - Liverpool" → NON sono giochi casino.
+Se navighi e finisci su una pagina sbagliata → FERMATI, torna a una sezione casino.
+Se l'agent ti dice "⚠️ ATTENZIONE: pagina NON-CASINO" → naviga SUBITO altrove.
+Se un'API ha campi ds/disciplina/quota/match → dati sportivi, IGNORA.
+Se i nomi sono "BI_BINGO01" o "PSG - Liverpool" → NON sono giochi casino.
+Se un URL API contiene TOURNAMENT o VIRTUAL → IGNORA, non è un catalogo.
 
 ════════════════════════════════════════
 STRATEGIA
@@ -163,11 +176,18 @@ FASE 1 — MAPPATURA SEZIONI
 - Le API spesso hanno system_code nel URL (SITO_SLOT, SITO_LIVE, SITO_CASINO)
 
 FASE 2 — ESTRAZIONE PER SEZIONE
-- Per ogni sezione casino: naviga → intercetta API → analizza campioni → estrai → fetch_merge URL → verify_urls → save_section
+- Per ogni sezione casino: naviga → wait_apis → analizza campioni → estrai → fetch_merge URL → verify_urls → save_section
 - PRIMA di save_section, VERIFICA i dati: guarda il campione. I giochi devono avere nomi tipo "Book of Ra", "Lightning Roulette", "Crazy Time" — NON "PSG-Liverpool" o "BI_BINGO01"
 - Se il campione sembra sospetto (nomi con squadre, codici bingo, quote) → NON salvare, cerca altrove
 - API con system_code tipo XXXXX_LIVE → catalogo live casino (NON bingo live!)
 - Su alcuni siti le slot sono dentro casino → se /casino ha 3000+ giochi con nomi di slot, le slot sono lì
+
+⚠️ REGOLA CRITICA — FETCH vs NAVIGATE:
+- Se una pagina è HTML (non JSON), il suo JavaScript NON viene eseguito con fetch_api
+- Per accedere a window.casinoData o altre variabili JS → devi NAVIGARE alla pagina, poi eval_js
+- Esempio SBAGLIATO: fetch_api /livecasino → ricevi HTML → eval_js (FALLISCE perché sei ancora sulla pagina precedente)
+- Esempio CORRETTO: navigate /livecasino → wait_apis 5000 → scan_js → eval_js window.casinoData.giochi
+- Guarda sempre "[Pagina: URL]" nel risultato per sapere dove sei. Se devi dati da un'altra pagina → NAVIGA prima!
 
 FASE 3 — VERIFICA COMPLETEZZA
 - Dopo save_section, confronta i conteggi: se il DOM dice "Tutti (365)" e hai 365 → OK
@@ -177,17 +197,18 @@ FASE 3 — VERIFICA COMPLETEZZA
 
 REGOLE
 1. Guarda le API intercettate — array con name/title/provider = catalogo
-2. API grossa non-JSON = HTML con dati JS inline → scan_js poi eval_js
+2. API grossa non-JSON = HTML con dati JS inline → NAVIGA alla pagina poi scan_js/eval_js (NON fetch!)
 3. Nessuna API utile → naviga alla sezione, poi wait_apis per intercettare
 4. Dopo navigate senza API → scroll per lazy load
-5. Endpoint sospetto → fetch_api
+5. Endpoint JSON sospetto → fetch_api (solo se è JSON, mai se è HTML!)
 6. scrape_dom solo come ultima risorsa
 7. MAI scaricare senza verificare che i dati siano GIOCHI CASINO reali
 8. MAI ripetere un'azione già fatta
 9. Preferisci SEMPRE JSON da API rispetto a scrape DOM
 10. DOPO fetch_merge, usa SEMPRE verify_urls per testare gli URL
 11. Se verify_urls dà 404, usa fix_urls per correggere il prefisso
-12. Rispondi SEMPRE e SOLO col JSON, max 15 parole nel reasoning`;
+12. Per cambiare sezione: save_section → navigate nuova sezione → wait_apis → estrai
+13. Rispondi SEMPRE e SOLO col JSON, max 15 parole nel reasoning`;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  SESSION — conversazione con Claude per ogni host
