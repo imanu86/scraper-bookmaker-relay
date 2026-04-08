@@ -121,7 +121,7 @@ save_section
   {"type":"save_section","value":"casino"}
 
 confirm_save
-  Conferma il salvataggio dopo che la validazione è OK. Usa lo stesso nome della sezione.
+  Conferma il salvataggio. Lo script CLASSIFICA AUTOMATICAMENTE ogni gioco (slot/casino/casino-live) in base a nome e provider, non alla sezione del sito. Es: "Lightning Roulette" di Evolution → casino-live, "Book of Ra" → slot, anche se il sito li mette tutti sotto /casino.
   {"type":"confirm_save","value":"casino"}
 
 download_all
@@ -194,6 +194,7 @@ FASE 3 — VERIFICA COMPLETEZZA
 - Se hai molto meno → cerca API paginata o scroll
 - Prima di download_all, verifica che TUTTE le sezioni casino siano state salvate
 - Il risultato finale deve avere giochi di casino REALI con: nome, provider, URL
+- La CLASSIFICAZIONE (slot/casino/casino-live) è AUTOMATICA basata su nome e provider, non sulla sezione del sito. Non preoccuparti se il sito mette tutto sotto /casino — lo script classifica correttamente ogni gioco
 
 REGOLE
 1. Guarda le API intercettate — array con name/title/provider = catalogo
