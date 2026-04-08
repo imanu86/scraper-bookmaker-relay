@@ -160,7 +160,7 @@ function getSession(host) {
             actions: [],
             actionKeys: new Set(),
             asks: 0,
-            tokens: { input: 0, output: 0 },
+            tokens: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
         });
     }
     return sessions.get(host);
@@ -218,10 +218,19 @@ async function askClaude(host, userMessage, retryCount) {
     // Aggiungi messaggio utente alla conversazione
     session.messages.push({ role: 'user', content: userMessage });
 
-    // Tieni max 30 messaggi per non sforare il contesto
-    if (session.messages.length > 30) {
-        session.messages = session.messages.slice(-20);
+    // Tieni max 20 messaggi per non sforare il contesto
+    if (session.messages.length > 20) {
+        session.messages = session.messages.slice(-14);
     }
+
+    // Prepara messaggi con caching: marca il primo messaggio per cache
+    const apiMessages = session.messages.map((m, i) => {
+        if (i === 0) {
+            // Il primo messaggio (contesto iniziale) viene cachato
+            return { role: m.role, content: [{ type: 'text', text: m.content, cache_control: { type: 'ephemeral' } }] };
+        }
+        return m;
+    });
 
     // Stima token (~4 char per token)
     const estimatedTokens = Math.round((SYSTEM_PROMPT.length + session.messages.reduce((s, m) => s + m.content.length, 0)) / 4);
@@ -235,8 +244,9 @@ async function askClaude(host, userMessage, retryCount) {
         const body = JSON.stringify({
             model: MODEL,
             max_tokens: 300,
-            system: SYSTEM_PROMPT,
-            messages: session.messages,
+            // System prompt come array con cache_control
+            system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
+            messages: apiMessages,
         });
 
         const result = await new Promise((resolve, reject) => {
@@ -248,6 +258,7 @@ async function askClaude(host, userMessage, retryCount) {
                     'Content-Type': 'application/json',
                     'x-api-key': API_KEY,
                     'anthropic-version': '2023-06-01',
+                    'anthropic-beta': 'prompt-caching-2024-07-31',
                     'Content-Length': Buffer.byteLength(body),
                 },
             }, (res) => {
@@ -276,10 +287,13 @@ async function askClaude(host, userMessage, retryCount) {
         if (result.usage) {
             session.tokens.input += result.usage.input_tokens || 0;
             session.tokens.output += result.usage.output_tokens || 0;
+            session.tokens.cache_read += result.usage.cache_read_input_tokens || 0;
+            session.tokens.cache_write += result.usage.cache_creation_input_tokens || 0;
         }
 
         session.messages.push({ role: 'assistant', content: text });
-        console.log(`[${host}] ✅ Claude: ${text.substring(0, 100)}`);
+        const cached = result.usage?.cache_read_input_tokens ? ` (${result.usage.cache_read_input_tokens} cached)` : '';
+        console.log(`[${host}] ✅ Claude: ${text.substring(0, 100)}${cached}`);
         return { text };
 
     } catch (e) {
@@ -505,7 +519,12 @@ app.get('/', (req, res) => {
             messages: s.messages.length,
             actions: s.actions.length,
             tokens: s.tokens,
-            cost: `$${((s.tokens.input / 1000000) * 1 + (s.tokens.output / 1000000) * 5).toFixed(4)}`,
+            cost: `$${(
+                (s.tokens.input / 1000000) * 1 + 
+                (s.tokens.output / 1000000) * 5 + 
+                (s.tokens.cache_write / 1000000) * 1.25 + 
+                (s.tokens.cache_read / 1000000) * 0.1
+            ).toFixed(4)}`,
         };
     });
     const recentTokens = rateLimiter.tokenLog.filter(e => Date.now() - e.ts < 60000).reduce((s, e) => s + e.tokens, 0);
