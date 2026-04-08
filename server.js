@@ -128,11 +128,13 @@ confirm_save
   {"type":"confirm_save","value":"casino"}
 
 download_all
-  Unisce TUTTE le sezioni salvate (deduplicando) e scarica un unico file completo.
+  Unisce TUTTE le sezioni salvate e scarica un unico file. Corregge automaticamente gli URL (live games → /livecasino/).
+  ⚠️ BLOCCA se ci sono sezioni del menu non ancora esplorate! Ti dirà quali mancano. Esplora TUTTE le sezioni prima!
   {"type":"download_all","filename":"sito_catalog_complete.json"}
 
 approve
   Catalogo completo e buono. Termina con successo.
+  ⚠️ BLOCCA se ci sono sezioni del menu non esplorate! Esplora TUTTO prima di approvare.
   {"type":"approve"}
 
 retry_different
