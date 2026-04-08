@@ -130,21 +130,38 @@ done
 ════════════════════════════════════════
 STRATEGIA
 ════════════════════════════════════════
+FASE 1 — MAPPATURA SEZIONI
+- Prima di tutto, guarda i link di navigazione per capire quali sezioni ha il sito (slot, casino, casino-live, ecc.)
+- Non tutti i siti hanno le stesse sezioni! Alcuni hanno slot separate, altri le includono nel casino
+- Identifica le sezioni reali del sito dai link nel menu (es: /slots, /casino, /livecasino, /casino-live)
+- Le API spesso hanno system_code nel URL che indica la sezione (es: SITO_SLOT, SITO_LIVE, SITO_CASINO)
+
+FASE 2 — ESTRAZIONE PER SEZIONE
+- Per ogni sezione: naviga → intercetta API → analizza campioni → estrai dati → fetch_merge URL → verify_urls → save_section
+- Se un'API ha campi come name/title/provider/image in un array → è probabilmente il catalogo
+- API grossa non-JSON (HTML) → potrebbe avere dati JS inline → scan_js poi eval_js
+- API con system_code tipo XXXXX_LIVE o XXXXX_SLOT → probabilmente catalogo di quella sezione
+- ATTENZIONE: su alcuni siti le slot sono dentro la sezione casino (non c'è una pagina /slots separata). Se navighi a /casino e trovi 3000+ giochi con nomi tipo slot, le slot sono lì. NON cercare una sezione slot separata se non esiste nei link.
+
+FASE 3 — VERIFICA COMPLETEZZA
+- Dopo ogni save_section, confronta il numero di giochi con le API intercettate e le immagini nel DOM
+- Se il sito mostra "Tutti (365)" o simile nel DOM e tu hai 365 giochi → sezione completa
+- Se hai estratto molto meno di quello che il sito dice di avere → cerca API paginata o scroll
+- Prima di download_all, verifica che tutte le sezioni identificate in FASE 1 siano state salvate
+
+REGOLE
 1. Guarda le API intercettate — array con name/title/provider = catalogo
 2. API grossa non-JSON = HTML con dati JS inline → scan_js poi eval_js
-3. Nessuna API utile → naviga a pagina slot, poi wait_apis
+3. Nessuna API utile → naviga alla sezione, poi wait_apis per intercettare
 4. Dopo navigate senza API → scroll per lazy load
 5. Endpoint sospetto → fetch_api
 6. scrape_dom solo come ultima risorsa
 7. MAI scaricare senza verificare che i dati contengano nomi giochi reali
 8. MAI ripetere un'azione già fatta
 9. Preferisci SEMPRE JSON da API rispetto a scrape DOM
-10. PRIMA di scaricare, cerca API con URL/slug SEO e usa fetch_merge per aggiungere i link
-11. DOPO fetch_merge, usa SEMPRE verify_urls per testare che gli URL funzionino. Se non funzionano, usa fix_urls per correggere il prefisso
-12. ESPLORA TUTTE LE SEZIONI: slot, casino, casino live. Per ogni sezione: estrai catalogo → fetch_merge URL → verify_urls → fix_urls se necessario → save_section
-13. Flusso per sezione: eval_js/use_api → fetch_merge (SEO URLs) → verify_urls 3 → se KO fix_urls → save_section → navigate alla prossima
-14. Alla fine: download_all per unire tutto
-15. Rispondi SEMPRE e SOLO col JSON, max 15 parole nel reasoning`;
+10. DOPO fetch_merge, usa SEMPRE verify_urls per testare che gli URL funzionino
+11. Se verify_urls mostra 404, usa fix_urls per correggere il prefisso
+12. Rispondi SEMPRE e SOLO col JSON, max 15 parole nel reasoning`;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  SESSION — conversazione con Claude per ogni host
@@ -382,8 +399,20 @@ function buildFirstMessage(ctx) {
     parts.push(`Framework: ${ctx.framework}`);
     parts.push(`Immagini giochi DOM: ${ctx.domImgs || 0}`);
 
+    // Sezioni del sito rilevate dal menu
+    if (ctx.siteSections?.length) {
+        parts.push('\nSezioni del sito (dal menu):');
+        ctx.siteSections.forEach(s => parts.push(`  ${s.name} → ${s.url}`));
+    }
+
+    // Conteggi giochi visibili nel DOM
+    if (ctx.gameCounts?.length) {
+        parts.push('\nConteggi giochi visibili nel DOM:');
+        ctx.gameCounts.forEach(g => parts.push(`  ${g.count} giochi — ${g.label}`));
+    }
+
     if (ctx.links?.length) {
-        parts.push('\nLink:');
+        parts.push('\nLink rilevanti:');
         ctx.links.forEach(l => parts.push(`  ${l.t} → ${l.h}`));
     }
 
@@ -403,10 +432,11 @@ function buildFirstMessage(ctx) {
     }
 
     if (ctx.savedSections && Object.keys(ctx.savedSections).length) {
-        parts.push('\nSezioni già salvate: ' + Object.entries(ctx.savedSections).map(([k,v]) => k+':'+v).join(', '));
+        parts.push('\nSezioni GIÀ SALVATE: ' + Object.entries(ctx.savedSections).map(([k,v]) => k+':'+v).join(', '));
+        parts.push('Devi ancora completare le sezioni mancanti!');
     }
 
-    parts.push('\nAnalizza e dimmi la prima azione.');
+    parts.push('\nAnalizza le sezioni del sito, le API intercettate, e dimmi la prima azione.');
     return parts.join('\n');
 }
 
@@ -425,8 +455,18 @@ function buildFollowUp(ctx, result) {
         }
     }
 
+    // Sezioni del sito (se cambiate dopo navigazione)
+    if (ctx.siteSections?.length) {
+        parts.push('Sezioni sito: ' + ctx.siteSections.map(s => s.name + '→' + s.url.substring(0, 60)).join(' | '));
+    }
+
     if (ctx.savedSections && Object.keys(ctx.savedSections).length) {
-        parts.push('Sezioni salvate: ' + Object.entries(ctx.savedSections).map(([k,v]) => k+':'+v).join(', '));
+        parts.push('Salvate: ' + Object.entries(ctx.savedSections).map(([k,v]) => k+':'+v).join(', '));
+    }
+
+    // Game counts dal DOM
+    if (ctx.gameCounts?.length) {
+        parts.push('Giochi nel DOM: ' + ctx.gameCounts.map(g => g.count + ' (' + g.label.substring(0,20) + ')').join(', '));
     }
 
     parts.push(`\nStep ${ctx.step}/${ctx.maxSteps}. Prossima azione?`);
