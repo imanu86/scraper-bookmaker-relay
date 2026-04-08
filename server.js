@@ -68,8 +68,16 @@ fetch_api
   POST: {"type":"fetch_api","value":"https://api.sito.it/games","method":"POST","body":"{\\"category\\":\\"slot\\"}"}
 
 fetch_paginated
-  Fetcha un endpoint paginato. Lo script itera tutte le pagine.
+  Fetcha un endpoint JSON paginato. Lo script itera tutte le pagine.
   {"type":"fetch_paginated","value":"https://api.sito.it/games","pageParam":"page","pageSize":50,"maxPages":30}
+
+fetch_html_games
+  Per siti SENZA API JSON (tipo Eurobet/AEM). Fetcha pagine HTML paginate e parsa giochi automaticamente.
+  Riconosce: data-gameid, data-gametitle, data-gamepath, data-thumbsrc, filter-*:fornitore/*.
+  L'URL deve contenere ".more.0/" o simile — lo script incrementa l'offset automaticamente.
+  {"type":"fetch_html_games","value":"https://www.eurobet.it/it/casino-live/tutti.more.0/","offsetStep":39,"maxPages":20}
+  offsetStep: incremento offset tra pagine (default 39)
+  ⚠️ Se fetch_api su un URL restituisce HTML con "TROVATI N giochi (data-gameid)" → usa fetch_html_games su quell'URL!
 
 scrape_dom
   Estrae giochi dal DOM della pagina CORRENTE: immagini, data-attributes, JSON inline.
@@ -208,22 +216,22 @@ FASE 3 — VERIFICA COMPLETEZZA
 - La CLASSIFICAZIONE (slot/casino/casino-live) è AUTOMATICA basata su nome e provider, non sulla sezione del sito. Non preoccuparti se il sito mette tutto sotto /casino — lo script classifica correttamente ogni gioco
 
 REGOLE
-1. Guarda le API intercettate — array con name/title/provider = catalogo
-2. API grossa non-JSON = HTML con dati JS inline → NAVIGA alla pagina poi scan_js/eval_js (NON fetch!)
-3. Nessuna API utile → naviga alla sezione, poi wait_apis per intercettare
-4. Dopo navigate senza API → scroll per lazy load
-5. Endpoint JSON sospetto → fetch_api (solo se è JSON, mai se è HTML!)
-6. scrape_dom solo come ultima risorsa
-7. MAI scaricare senza verificare che i dati siano GIOCHI CASINO reali
-8. MAI ripetere un'azione già fatta
-9. Preferisci SEMPRE JSON da API rispetto a scrape DOM
-10. OGNI sezione DEVE avere URL! Fai SEMPRE fetch_merge su OGNI sezione prima di save_section. Se non trovi URL via API, costruiscili dal nome/slug del gioco
-11. DOPO fetch_merge, usa SEMPRE verify_urls per testare gli URL
-12. Se verify_urls dà 404, usa fix_urls per correggere il prefisso
-13. MAI save_section senza URL — se i giochi non hanno URL, prima fai fetch_merge o costruiscili
-14. Per cambiare sezione: save_section → navigate nuova sezione → wait_apis → estrai → fetch_merge → verify_urls → save_section
+1. Guarda le API intercettate — array con name/title/provider = catalogo JSON
+2. API grossa non-JSON con dati JS inline → NAVIGA alla pagina poi scan_js/eval_js (NON fetch!)
+3. API HTML con "TROVATI N giochi (data-gameid)" → usa fetch_html_games! Sito tipo AEM/Eurobet senza API JSON
+4. Nessuna API utile → naviga alla sezione, poi wait_apis per intercettare
+5. Dopo navigate senza API → scroll per lazy load
+6. Endpoint JSON sospetto → fetch_api
+7. scrape_dom solo come ultima risorsa
+8. MAI scaricare senza verificare che i dati siano GIOCHI CASINO reali
+9. MAI ripetere un'azione già fatta
+10. Preferisci: JSON API > fetch_html_games > scrape_dom
+11. OGNI sezione DEVE avere URL! Se i giochi non hanno URL: fetch_merge, oppure costruiscili dal path/slug
+12. DOPO aver aggiunto URL, usa verify_urls per testare
+13. Se verify_urls dà 404, usa fix_urls per correggere il prefisso
+14. Per cambiare sezione: save_section → navigate nuova sezione → wait_apis → estrai → save_section
 15. Rispondi SEMPRE e SOLO col JSON, max 15 parole nel reasoning
-16. Se non sei sicuro di qualcosa, usa ask_user per chiedere all'operatore umano. Lui ti darà feedback.
+16. Se non sei sicuro di qualcosa, usa ask_user per chiedere all'operatore umano
 17. L'operatore può mandarti feedback in qualsiasi momento — leggilo e adatta il tuo comportamento`;
 
 // ═══════════════════════════════════════════════════════════════════════
