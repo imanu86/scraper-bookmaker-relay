@@ -78,8 +78,9 @@ eval_js
   ⚠️ CRITICO: eval_js funziona SOLO sulla pagina dove l'agent si trova adesso!
   Se devi estrarre dati da /livecasino, PRIMA naviga a /livecasino, POI usa eval_js.
   Se sei su /casino e fai eval_js, ottieni i dati di /casino, NON di /livecasino!
-  Il risultato ti dice sempre "[Pagina: URL]" per confermare dove sei.
-  {"type":"eval_js","value":"window.casinoData.giochi"}
+  ⚠️ Il risultato SOVRASCRIVE il catalogo SOLO se ha >= elementi. Per sbirciare un campione senza rovinare i dati, usa .slice() — il catalogo completo resta intatto.
+  Estrarre TUTTO: {"type":"eval_js","value":"window.casinoData.giochi"}
+  Sbirciare campione: {"type":"eval_js","value":"window.casinoData.giochi.slice(0,3)"}
 
 scan_js
   Scansiona la pagina CORRENTE cercando variabili JS globali con dati.
@@ -109,8 +110,10 @@ fix_urls
   Utile se verify_urls mostra che gli URL hanno il prefisso sbagliato.
 
 run
-  Esegue codice JS arbitrario con accesso ai dati. Variabili disponibili: CATALOG (array giochi), APIS (dati API salvati), SAMPLES (campioni API). Assegna il risultato a RESULT.
-  {"type":"run","value":"var count = CATALOG.filter(g => g.url).length; RESULT = 'Giochi con URL: ' + count"}
+  Esegue codice JS con accesso ai dati. CATALOG = copia dei giochi attuali (modifiche NON toccano il catalogo). RESULT = output.
+  ⚠️ Il risultato SOVRASCRIVE il catalogo SOLO se ha >= elementi di quello attuale. Per ispezionare senza modificare, usa RESULT (stringa/numero).
+  Ispeziona: {"type":"run","value":"RESULT = 'Con URL: ' + CATALOG.filter(g => g.url).length + '/' + CATALOG.length"}
+  Trasforma: {"type":"run","value":"RESULT = CATALOG.map(g => { g.url = 'https://sito.it/' + g.slug; return g })"}
 
 download
   Scarica i dati correnti come file JSON.
