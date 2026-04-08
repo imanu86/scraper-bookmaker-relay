@@ -206,10 +206,12 @@ REGOLE
 7. MAI scaricare senza verificare che i dati siano GIOCHI CASINO reali
 8. MAI ripetere un'azione già fatta
 9. Preferisci SEMPRE JSON da API rispetto a scrape DOM
-10. DOPO fetch_merge, usa SEMPRE verify_urls per testare gli URL
-11. Se verify_urls dà 404, usa fix_urls per correggere il prefisso
-12. Per cambiare sezione: save_section → navigate nuova sezione → wait_apis → estrai
-13. Rispondi SEMPRE e SOLO col JSON, max 15 parole nel reasoning`;
+10. OGNI sezione DEVE avere URL! Fai SEMPRE fetch_merge su OGNI sezione prima di save_section. Se non trovi URL via API, costruiscili dal nome/slug del gioco
+11. DOPO fetch_merge, usa SEMPRE verify_urls per testare gli URL
+12. Se verify_urls dà 404, usa fix_urls per correggere il prefisso
+13. MAI save_section senza URL — se i giochi non hanno URL, prima fai fetch_merge o costruiscili
+14. Per cambiare sezione: save_section → navigate nuova sezione → wait_apis → estrai → fetch_merge → verify_urls → save_section
+15. Rispondi SEMPRE e SOLO col JSON, max 15 parole nel reasoning`;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  SESSION — conversazione con Claude per ogni host
