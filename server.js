@@ -155,9 +155,51 @@ function getSession(host) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+//  RATE LIMITER — max 40K input tokens/min (buffer sotto il limite di 50K)
+// ═══════════════════════════════════════════════════════════════════════
+const rateLimiter = {
+    tokenLog: [],  // [{ts, tokens}]
+    MAX_TOKENS_PER_MIN: 40000,
+    MIN_INTERVAL_MS: 3000,  // minimo 3s tra richieste
+    lastRequestTs: 0,
+
+    async waitIfNeeded(estimatedTokens) {
+        const now = Date.now();
+
+        // Pulisci log vecchi (>60s)
+        this.tokenLog = this.tokenLog.filter(e => now - e.ts < 60000);
+
+        // Calcola token usati nell'ultimo minuto
+        const usedTokens = this.tokenLog.reduce((sum, e) => sum + e.tokens, 0);
+
+        // Se sforiamo, aspetta
+        if (usedTokens + estimatedTokens > this.MAX_TOKENS_PER_MIN) {
+            const oldestTs = this.tokenLog.length ? this.tokenLog[0].ts : now;
+            const waitMs = 60000 - (now - oldestTs) + 1000; // aspetta che il più vecchio scada + 1s buffer
+            console.log(`[rate] ⏳ ${usedTokens}+${estimatedTokens} > ${this.MAX_TOKENS_PER_MIN} tokens/min → attendo ${Math.round(waitMs/1000)}s`);
+            await new Promise(r => setTimeout(r, waitMs));
+        }
+
+        // Intervallo minimo tra richieste
+        const elapsed = now - this.lastRequestTs;
+        if (elapsed < this.MIN_INTERVAL_MS) {
+            const wait = this.MIN_INTERVAL_MS - elapsed;
+            await new Promise(r => setTimeout(r, wait));
+        }
+
+        this.lastRequestTs = Date.now();
+    },
+
+    record(tokens) {
+        this.tokenLog.push({ ts: Date.now(), tokens });
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════
 //  CLAUDE API
 // ═══════════════════════════════════════════════════════════════════════
-async function askClaude(host, userMessage) {
+async function askClaude(host, userMessage, retryCount) {
+    retryCount = retryCount || 0;
     const session = getSession(host);
     session.asks++;
 
@@ -169,7 +211,13 @@ async function askClaude(host, userMessage) {
         session.messages = session.messages.slice(-20);
     }
 
-    console.log(`[${host}] 🤖 Claude ask #${session.asks} (${session.messages.length} msgs, ${userMessage.length} chars)`);
+    // Stima token (~4 char per token)
+    const estimatedTokens = Math.round((SYSTEM_PROMPT.length + session.messages.reduce((s, m) => s + m.content.length, 0)) / 4);
+
+    // Rate limit
+    await rateLimiter.waitIfNeeded(estimatedTokens);
+
+    console.log(`[${host}] 🤖 Claude ask #${session.asks} (~${estimatedTokens} tokens, ${session.messages.length} msgs)`);
 
     try {
         const body = JSON.stringify({
@@ -209,6 +257,10 @@ async function askClaude(host, userMessage) {
 
         const text = result.content?.[0]?.text || '';
 
+        // Registra token usati per il rate limiter
+        const actualTokens = (result.usage?.input_tokens || estimatedTokens) + (result.usage?.output_tokens || 0);
+        rateLimiter.record(actualTokens);
+
         if (result.usage) {
             session.tokens.input += result.usage.input_tokens || 0;
             session.tokens.output += result.usage.output_tokens || 0;
@@ -219,7 +271,22 @@ async function askClaude(host, userMessage) {
         return { text };
 
     } catch (e) {
-        console.error(`[${host}] ❌ Fetch error: ${e.message}`);
+        console.error(`[${host}] ❌ ${e.message}`);
+
+        // Rimuovi l'ultimo messaggio user dalla conversazione (non ha ricevuto risposta)
+        if (session.messages.length && session.messages[session.messages.length - 1].role === 'user') {
+            session.messages.pop();
+        }
+
+        // Retry su 429 (rate limit)
+        if (e.message.includes('429') && retryCount < 3) {
+            const waitSec = 15 * (retryCount + 1); // 15s, 30s, 45s
+            console.log(`[${host}] 🔄 Retry #${retryCount + 1} tra ${waitSec}s...`);
+            await new Promise(r => setTimeout(r, waitSec * 1000));
+            session.asks--; // non contare il retry come ask separata
+            return askClaude(host, userMessage, retryCount + 1);
+        }
+
         return { error: e.message };
     }
 }
@@ -429,6 +496,7 @@ app.get('/', (req, res) => {
             cost: `$${((s.tokens.input / 1000000) * 1 + (s.tokens.output / 1000000) * 5).toFixed(4)}`,
         };
     });
+    const recentTokens = rateLimiter.tokenLog.filter(e => Date.now() - e.ts < 60000).reduce((s, e) => s + e.tokens, 0);
     res.json({
         status: 'ok',
         service: 'relay-v4-api',
@@ -436,6 +504,7 @@ app.get('/', (req, res) => {
         apiKey: API_KEY ? 'set (' + API_KEY.substring(0, 10) + '...)' : 'NOT SET',
         agents: agents.size,
         uptime: Math.round(process.uptime()) + 's',
+        rateLimit: `${recentTokens}/${rateLimiter.MAX_TOKENS_PER_MIN} tokens/min`,
         sessions: ss,
     });
 });
