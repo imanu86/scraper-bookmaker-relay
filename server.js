@@ -17,7 +17,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, maxPayload: 2 * 1024 * 1024 });
 
 const API_KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL = process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001';
+const MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514';
 
 if (!API_KEY) console.warn('⚠️  ANTHROPIC_API_KEY non impostata! Claude API non funzionerà.');
 
@@ -141,6 +141,10 @@ retry_different
   Resetta tutti i dati e riparti con strategia diversa.
   {"type":"retry_different"}
 
+ask_user
+  Chiedi qualcosa all'operatore umano. Lui vede la domanda e ti risponde. Usa quando sei incerto.
+  {"type":"ask_user","value":"Il sito ha /livecasino o /casino-live? Non trovo il link nel menu."}
+
 done
   Impossibile estrarre. Termina.
   {"type":"done"}
@@ -216,7 +220,30 @@ REGOLE
 12. Se verify_urls dà 404, usa fix_urls per correggere il prefisso
 13. MAI save_section senza URL — se i giochi non hanno URL, prima fai fetch_merge o costruiscili
 14. Per cambiare sezione: save_section → navigate nuova sezione → wait_apis → estrai → fetch_merge → verify_urls → save_section
-15. Rispondi SEMPRE e SOLO col JSON, max 15 parole nel reasoning`;
+15. Rispondi SEMPRE e SOLO col JSON, max 15 parole nel reasoning
+16. Se non sei sicuro di qualcosa, usa ask_user per chiedere all'operatore umano. Lui ti darà feedback.
+17. L'operatore può mandarti feedback in qualsiasi momento — leggilo e adatta il tuo comportamento`;
+
+// ═══════════════════════════════════════════════════════════════════════
+//  LEARNED KNOWLEDGE — strategie apprese dai feedback
+//  Persiste in memoria, può essere salvata/caricata via API
+// ═══════════════════════════════════════════════════════════════════════
+let learnedKnowledge = [];
+// Formato: [{platform:"XCasino", pattern:"window.casinoData.giochi ha il catalogo", sites:["netbet.it","domusbet.it"]}]
+
+function buildSystemPrompt() {
+    let prompt = SYSTEM_PROMPT;
+    if (learnedKnowledge.length > 0) {
+        prompt += '\n\n════════════════════════════════════════\nCONOSCENZE APPRESE DA SESSIONI PRECEDENTI\n════════════════════════════════════════\n';
+        learnedKnowledge.forEach((k, i) => {
+            prompt += `${i + 1}. ${k.pattern}`;
+            if (k.sites?.length) prompt += ` (verificato su: ${k.sites.join(', ')})`;
+            prompt += '\n';
+        });
+        prompt += '\nUsa queste conoscenze per essere più efficiente sui siti simili.\n';
+    }
+    return prompt;
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 //  SESSION — conversazione con Claude per ogni host
@@ -305,7 +332,7 @@ async function askClaude(host, userMessage, retryCount) {
     });
 
     // Stima token (~4 char per token)
-    const estimatedTokens = Math.round((SYSTEM_PROMPT.length + session.messages.reduce((s, m) => s + m.content.length, 0)) / 4);
+    const estimatedTokens = Math.round((buildSystemPrompt().length + session.messages.reduce((s, m) => s + m.content.length, 0)) / 4);
 
     // Rate limit
     await rateLimiter.waitIfNeeded(estimatedTokens);
@@ -313,11 +340,11 @@ async function askClaude(host, userMessage, retryCount) {
     console.log(`[${host}] 🤖 Claude ask #${session.asks} (~${estimatedTokens} tokens, ${session.messages.length} msgs)`);
 
     try {
+        const currentPrompt = buildSystemPrompt();
         const body = JSON.stringify({
             model: MODEL,
             max_tokens: 300,
-            // System prompt come array con cache_control
-            system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
+            system: [{ type: 'text', text: currentPrompt, cache_control: { type: 'ephemeral' } }],
             messages: apiMessages,
         });
 
@@ -656,6 +683,17 @@ app.get('/sessions/:host/chat', (req, res) => {
 app.delete('/sessions', (req, res) => { sessions.clear(); res.json({ ok: true }); });
 app.delete('/sessions/:host', (req, res) => { sessions.delete(req.params.host); res.json({ ok: true }); });
 
+// Learned knowledge
+app.get('/knowledge', (req, res) => res.json(learnedKnowledge));
+app.post('/knowledge', (req, res) => {
+    const { pattern, sites, platform } = req.body;
+    if (!pattern) return res.status(400).json({ error: 'pattern required' });
+    learnedKnowledge.push({ pattern, sites: sites || [], platform: platform || '', ts: Date.now() });
+    console.log(`[+] Knowledge: ${pattern}`);
+    res.json({ ok: true, total: learnedKnowledge.length });
+});
+app.delete('/knowledge', (req, res) => { learnedKnowledge = []; res.json({ ok: true }); });
+
 // ═══════════════════════════════════════════════════════════════════════
 //  WEBSOCKET
 // ═══════════════════════════════════════════════════════════════════════
@@ -664,7 +702,7 @@ wss.on('connection', (ws, req) => {
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
 
-    ws.on('message', (raw) => {
+    ws.on('message', async (raw) => {
         try {
             const msg = JSON.parse(raw);
 
@@ -678,6 +716,50 @@ wss.on('connection', (ws, req) => {
 
             if (ws._role === 'agent' && msg.type === 'need_help') {
                 handleNeedHelp(ws, msg);
+                return;
+            }
+
+            // Feedback dall'operatore umano → aggiunge alla conversazione Claude
+            if (ws._role === 'agent' && msg.type === 'user_feedback') {
+                const host = msg.host || '?';
+                const session = getSession(host);
+                const feedback = `[FEEDBACK OPERATORE]: ${msg.feedback}`;
+                console.log(`[${host}] 💬 Feedback: ${msg.feedback.substring(0, 80)}`);
+
+                // Manda il feedback a Claude e ottieni nuova azione
+                const response = await askClaude(host, feedback);
+                if (response.text) {
+                    const parsed = parseAction(response.text);
+                    if (parsed?.action) {
+                        ws.send(JSON.stringify({
+                            type: 'action',
+                            reasoning: '[CLAUDE] ' + (parsed.reasoning || ''),
+                            action: parsed.action
+                        }));
+                    } else {
+                        ws.send(JSON.stringify({ type: 'claude_message', text: response.text }));
+                    }
+                }
+                return;
+            }
+
+            // Risposta dell'operatore a una domanda di Claude (ask_user)
+            if (ws._role === 'agent' && msg.type === 'user_answer') {
+                const host = msg.host || '?';
+                const answer = `[RISPOSTA OPERATORE]: ${msg.answer}`;
+                console.log(`[${host}] 💬 Risposta: ${msg.answer.substring(0, 80)}`);
+
+                const response = await askClaude(host, answer);
+                if (response.text) {
+                    const parsed = parseAction(response.text);
+                    if (parsed?.action) {
+                        ws.send(JSON.stringify({
+                            type: 'action',
+                            reasoning: '[CLAUDE] ' + (parsed.reasoning || ''),
+                            action: parsed.action
+                        }));
+                    }
+                }
                 return;
             }
 
