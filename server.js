@@ -94,8 +94,16 @@ run
   {"type":"run","value":"var count = CATALOG.filter(g => g.url).length; RESULT = 'Giochi con URL: ' + count"}
 
 download
-  Scarica i dati selezionati come file JSON.
+  Scarica i dati correnti come file JSON.
   {"type":"download","filename":"sito_catalog.json"}
+
+save_section
+  Salva il catalogo corrente con un'etichetta. I dati persistono anche dopo navigazione. Dopo il salvataggio i dati correnti vengono resettati, pronto per la prossima sezione.
+  {"type":"save_section","value":"slots"}
+
+download_all
+  Unisce TUTTE le sezioni salvate (deduplicando) e scarica un unico file completo.
+  {"type":"download_all","filename":"sito_catalog_complete.json"}
 
 approve
   Catalogo completo e buono. Termina con successo.
@@ -121,9 +129,10 @@ STRATEGIA
 7. MAI scaricare senza verificare che i dati contengano nomi giochi reali
 8. MAI ripetere un'azione già fatta
 9. Preferisci SEMPRE JSON da API rispetto a scrape DOM
-10. PRIMA di scaricare, cerca API con URL/slug SEO (tipo /seodata, /seo, /urls) e usa fetch_merge per aggiungere i link al catalogo
-11. Un catalogo completo ha: nome, provider, immagine, URL pagina gioco. Se mancano gli URL, cercali!
-12. Rispondi SEMPRE e SOLO col JSON, max 15 parole nel reasoning`;
+10. PRIMA di scaricare, cerca API con URL/slug SEO e usa fetch_merge per aggiungere i link
+11. ESPLORA TUTTE LE SEZIONI: dopo aver completato slot, usa save_section per salvare, poi naviga a casino, poi casino live. Alla fine usa download_all per unire tutto
+12. Flusso multi-sezione: estrai slot → fetch_merge URL → save_section "slots" → navigate /casino → estrai → fetch_merge → save_section "casino" → navigate /casino-live → estrai → save_section "casino_live" → download_all
+13. Rispondi SEMPRE e SOLO col JSON, max 15 parole nel reasoning`;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  SESSION — conversazione con Claude per ogni host
@@ -300,6 +309,10 @@ function buildFirstMessage(ctx) {
         parts.push('\nNessuna API grossa intercettata.');
     }
 
+    if (ctx.savedSections && Object.keys(ctx.savedSections).length) {
+        parts.push('\nSezioni già salvate: ' + Object.entries(ctx.savedSections).map(([k,v]) => k+':'+v).join(', '));
+    }
+
     parts.push('\nAnalizza e dimmi la prima azione.');
     return parts.join('\n');
 }
@@ -317,6 +330,10 @@ function buildFollowUp(ctx, result) {
                 if (api.arrays) api.arrays.slice(0, 2).forEach(a => parts.push(`  → ${a.key}(${a.length}): ${a.sampleItem}`));
             });
         }
+    }
+
+    if (ctx.savedSections && Object.keys(ctx.savedSections).length) {
+        parts.push('Sezioni salvate: ' + Object.entries(ctx.savedSections).map(([k,v]) => k+':'+v).join(', '));
     }
 
     parts.push(`\nStep ${ctx.step}/${ctx.maxSteps}. Prossima azione?`);
