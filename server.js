@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════
-//  Scraper Bookmaker Relay v6 — Claude analizza diagnostica, decide strategia
+//  Scraper Bookmaker Relay v7 — Claude vede la pagina, decide cosa fare
 // ═══════════════════════════════════════════════════════════════════════
 
 const express = require('express');
@@ -13,40 +13,63 @@ const wss = new WebSocketServer({ server, maxPayload: 2 * 1024 * 1024 });
 
 const API_KEY = process.env.ANTHROPIC_API_KEY;
 const MODEL = 'claude-sonnet-4-20250514';
-if (!API_KEY) console.warn('⚠️  ANTHROPIC_API_KEY non impostata!');
+if (!API_KEY) console.warn('⚠️ ANTHROPIC_API_KEY mancante');
 
 let agents = new Set();
 
 // ═══ SYSTEM PROMPT ═══
-const SYSTEM_PROMPT = `Sei un analista che guida un agente browser per estrarre cataloghi giochi da bookmaker.
-L'agente ti manda DIAGNOSTICA compatta dopo ogni operazione. Tu analizzi i numeri e decidi la prossima mossa.
+const SYSTEM_PROMPT = `Sei un operatore che guida un agente browser per estrarre il catalogo giochi completo da siti di bookmaker italiani.
 
-COMANDI (rispondi SOLO JSON, nessun testo o markdown):
-{"reasoning":"max 15 parole","action":"COMANDO","value":"..."}
+L'agente ti manda SNAPSHOT della pagina: URL, link di navigazione, bottoni visibili, conteggi giochi, elementi nel DOM, API intercettate, variabili JS, giochi già estratti/salvati.
 
-COMANDI DISPONIBILI:
-- navigate_section: vai a una sezione → value="/it/slot/tutti/"
-- extract: prova estrazione automatica (l'agente tenta: xcasino → api → html_pages → scroll → js_vars)
-- retry_method: forza un metodo specifico → value="html_pages" o "scroll_dom" o "xcasino_js" o "json_api"
-- save_section: salva sezione → value="slot"
-- next_section: salva e naviga alla prossima sezione non estratta
-- download_all: scarica catalogo completo
-- ask_user: chiedi all'operatore → value="domanda"
+Tu VEDI la pagina attraverso gli occhi dell'agente. Analizza lo snapshot e decidi L'AZIONE GIUSTA.
 
-COME ANALIZZARE LA DIAGNOSTICA:
-- conteggio basso vs dichiarato → metodo sbagliato, prova retry_method con un altro
-- provider vuoti → il metodo non cattura il provider, prova un altro
-- URL vuoti → serve arricchimento o metodo diverso
-- 0 giochi → pagina sbagliata o serve navigare prima
+COMANDI (rispondi SOLO JSON):
+{"reasoning":"max 20 parole","action":"COMANDO", ...parametri}
 
-FLUSSO: navigate → extract → analizza diagnostica → se OK save, se problemi retry_method → quando tutto OK → download_all.
-SOLO JSON. MAI markdown, MAI testo libero.`;
+click       → {"action":"click","text":"Tutti"} o {"action":"click","selector":".btn-all"}
+navigate    → {"action":"navigate","value":"https://www.sito.it/casino/"}
+scroll_all  → {"action":"scroll_all"} — scrolla gradualmente per caricare tutti i giochi
+wait        → {"action":"wait","ms":5000} — aspetta che il contenuto carichi
+snapshot    → {"action":"snapshot"} — rileggimi la pagina
+extract_games → {"action":"extract_games"} — estrai giochi dal DOM (o da window.casinoData se presente)
+extract_api → {"action":"extract_api","value":"https://api.sito.it/games"} — fetcha un API JSON
+fetch_pages → {"action":"fetch_pages","value":"https://sito.it/slot/tutti.more.0/","step":39} — pagine HTML
+eval_js     → {"action":"eval_js","value":"window.casinoData.giochi.length"}
+save_section → {"action":"save_section","value":"slot"}
+download_all → {"action":"download_all"}
+ask_user    → {"action":"ask_user","value":"domanda per l'operatore"}
+
+COME LEGGERE LO SNAPSHOT:
+- nav: link di navigazione → ti dice quali sezioni ha il sito (slot, casino, live)
+- buttons: bottoni/tab cliccabili → se vedi "Tutti"/"All" E gameElements è basso, CLICCA PRIMA
+- gameCounts: numeri tipo "5806 Giochi" → quanti giochi DICHIARA il sito
+- gameElements: quanti giochi sono nel DOM ORA → se molto meno di gameCounts, serve scroll o fetch_pages
+- apis: API intercettate → se c'è un JSON con array di giochi, usa extract_api
+- jsVars: variabili JS → se c'è casinoData, usa extract_games (lo fa automaticamente)
+- saved: sezioni già salvate → non rifare quelle già fatte
+- extracted: giochi già estratti → se >0, controlla urls e providers nel extractedDetail
+
+STRATEGIA:
+1. GUARDA i bottoni — se c'è "Tutti"/"Tutte le slot"/"All games" e NON è già attivo → click prima!
+2. GUARDA gameElements vs gameCounts — se pochi nel DOM → scroll_all o fetch_pages
+3. GUARDA jsVars — se c'è casinoData → extract_games (XCasino, piglia tutto subito)
+4. GUARDA apis — se c'è un JSON grosso con array → extract_api
+5. Dopo extract, GUARDA extractedDetail — se urls o providers sono bassi → il metodo è sbagliato, prova un altro
+6. Sezioni: slot → casino → casino-live → download_all
+
+REGOLE:
+- SOLO JSON, MAI testo o markdown
+- reasoning max 20 parole
+- Se non capisci la pagina → ask_user
+- NON salvare senza URL
+- Dopo ogni azione l'agente ti manda un nuovo snapshot — RILEGGILO prima di decidere`;
 
 // ═══ KNOWLEDGE ═══
 let knowledge = [];
 function buildPrompt() {
     let p = SYSTEM_PROMPT;
-    if (knowledge.length) p += '\n\nCONOSCENZE:\n' + knowledge.map((k, i) => `${i + 1}. ${k.pattern}`).join('\n');
+    if (knowledge.length) p += '\n\nCONOSCENZE APPRESE:\n' + knowledge.map((k, i) => `${i + 1}. ${k.pattern}`).join('\n');
     return p;
 }
 
@@ -80,7 +103,7 @@ async function ask(host, msg, retry) {
 
     console.log(`[${host}] 🤖 #${s.asks} ~${est}tok`);
     try {
-        const body = JSON.stringify({ model: MODEL, max_tokens: 200, system: [{ type: 'text', text: prompt, cache_control: { type: 'ephemeral' } }], messages: apiMsgs });
+        const body = JSON.stringify({ model: MODEL, max_tokens: 250, system: [{ type: 'text', text: prompt, cache_control: { type: 'ephemeral' } }], messages: apiMsgs });
         const result = await new Promise((res, rej) => {
             const req = https.request({ hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'anthropic-beta': 'prompt-caching-2024-07-31', 'Content-Length': Buffer.byteLength(body) }
@@ -101,23 +124,36 @@ async function ask(host, msg, retry) {
             await new Promise(r => setTimeout(r, 15000 * (retry + 1)));
             return ask(host, msg, retry + 1);
         }
-        return JSON.stringify({ reasoning: 'API error', action: 'ask_user', value: 'Errore API: ' + e.message });
+        return JSON.stringify({ reasoning: 'Errore API, chiedo aiuto', action: 'ask_user', value: 'Errore API Claude: ' + e.message.substring(0, 100) });
     }
 }
 
 function parse(text) {
     text = (text || '').replace(/```json\s*/g, '').replace(/```/g, '').trim();
     try { const p = JSON.parse(text); if (p?.action) return p; } catch (e) {}
-    const m = text.match(/\{[^{}]*"action"[^{}]*\}/);
-    if (m) try { const p = JSON.parse(m[0]); if (p?.action) return p; } catch (e) {}
+    // Try to find JSON in text
+    for (let i = 0; i < text.length; i++) {
+        if (text[i] !== '{') continue;
+        let d = 0;
+        for (let j = i; j < text.length; j++) { if (text[j] === '{') d++; if (text[j] === '}') d--; if (d === 0) { try { const p = JSON.parse(text.substring(i, j + 1)); if (p?.action) return p; } catch (e) {} break; } }
+    }
     return null;
 }
 
-// ═══ HANDLE MESSAGES ═══
+// ═══ HANDLE ═══
 async function handle(ws, msg) {
     const host = msg.host || '?';
     if (!API_KEY) { ws.send(JSON.stringify({ type: 'error', message: 'API KEY mancante' })); return; }
-    const text = await ask(host, msg.diagnostic || msg.report || JSON.stringify(msg));
+
+    // Build message from snapshot
+    let content;
+    if (msg.snapshot) {
+        content = 'SNAPSHOT:\n' + JSON.stringify(msg.snapshot, null, 1);
+    } else {
+        content = msg.diagnostic || msg.report || JSON.stringify(msg);
+    }
+
+    const text = await ask(host, content);
     const action = parse(text);
     if (action) ws.send(JSON.stringify({ type: 'action', ...action }));
     else ws.send(JSON.stringify({ type: 'error', message: 'Non parsabile: ' + text.substring(0, 150) }));
@@ -128,7 +164,7 @@ app.use(express.json());
 app.get('/', (req, res) => {
     const ss = {}; sessions.forEach((s, h) => { ss[h] = { asks: s.asks, msgs: s.messages.length, tokens: s.tokens,
         cost: `$${((s.tokens.i / 1e6) * 3 + (s.tokens.o / 1e6) * 15 + (s.tokens.cr / 1e6) * 0.3 + (s.tokens.cw / 1e6) * 3.75).toFixed(4)}` }; });
-    res.json({ v: 6, model: MODEL, agents: agents.size, sessions: ss });
+    res.json({ v: 7, model: MODEL, agents: agents.size, knowledge: knowledge.length, sessions: ss });
 });
 app.get('/sessions/:h/chat', (req, res) => { const s = sessions.get(req.params.h); res.json(s ? s.messages : []); });
 app.delete('/sessions', (req, res) => { sessions.clear(); res.json({ ok: 1 }); });
@@ -143,8 +179,8 @@ wss.on('connection', (ws) => {
     ws.on('message', async (raw) => {
         try {
             const msg = JSON.parse(raw);
-            if (msg.type === 'register') { agents.add(ws); ws.send(JSON.stringify({ type: 'registered', v: 6 })); return; }
-            if (msg.type === 'diagnostic') { handle(ws, msg); return; }
+            if (msg.type === 'register') { agents.add(ws); ws.send(JSON.stringify({ type: 'registered', v: 7 })); return; }
+            if (msg.type === 'snapshot' || msg.type === 'diagnostic') { handle(ws, msg); return; }
             if (msg.type === 'user_feedback') { const t = await ask(msg.host || '?', `[OPERATORE]: ${msg.feedback}`); const a = parse(t); if (a) ws.send(JSON.stringify({ type: 'action', ...a })); return; }
             if (msg.type === 'user_answer') { const t = await ask(msg.host || '?', `[RISPOSTA]: ${msg.answer}`); const a = parse(t); if (a) ws.send(JSON.stringify({ type: 'action', ...a })); return; }
         } catch (e) { console.error('[err]', e.message); }
@@ -154,4 +190,4 @@ wss.on('connection', (ws) => {
 setInterval(() => { wss.clients.forEach(ws => { if (!ws.isAlive) return ws.terminate(); ws.isAlive = false; ws.ping(); }); }, 30000);
 setInterval(() => { const cut = Date.now() - 7200000; sessions.forEach((s, h) => { if (s.ts < cut) sessions.delete(h); }); }, 300000);
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => { console.log(`Relay v6 :${PORT}`); });
+server.listen(PORT, () => { console.log(`Relay v7 :${PORT}`); });
