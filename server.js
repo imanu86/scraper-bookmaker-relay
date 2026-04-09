@@ -43,11 +43,13 @@ nav: link navigazione → sezioni del sito (slot, casino, live)
 buttons: bottoni/tab cliccabili → se "Tutti" non attivo → CLICCA PRIMA
 gameCounts: numeri es [5806] → giochi dichiarati dal sito
 gameElements: giochi nel DOM ora → se << gameCounts → servono più giochi
+gameElWithUrl: es "520/6066" → quanti gameElements hanno anche URL (data-gamepath). Se basso = il DOM carica le card ma senza URL
 apis: API intercettate → JSON con array giochi = tesoro
+paginationUrls: URL con .more.N/ o page= intercettati dal browser → USA QUESTI per fetch_pages, NON inventare URL!
 jsVars: variabili JS → casinoData = XCasino, piglia tutto con extract_games
 saved: sezioni salvate → NON rifare
-extracted: giochi estratti ora → controlla extractedDetail per qualità
-quality: {urls:N, providers:N, images:N} → se bassi = estrazione incompleta
+extracted: giochi estratti ora → controlla quality per qualità
+quality: {urls:N, providers:N, total:N, urlPct:"49%"} → se urlPct basso = estrazione incompleta
 
 ═══ OBIETTIVO ═══
 Estrarre TUTTE le sezioni: slot, casino, casino-live. Ogni gioco DEVE avere: nome, URL, provider.
@@ -57,12 +59,11 @@ IGNORA: sport, bingo, poker, lotterie, carte, ippica, virtuali.
 1. Analizza snapshot iniziale → identifica sezioni dal nav
 2. Per OGNI sezione:
    a. navigate alla sezione
-   b. Leggi snapshot → cerca bottone "Tutti"/"All" → click se presente
-   c. Aspetta (wait 3000) → snapshot
-   d. Scegli metodo estrazione (vedi sotto)
-   e. Verifica qualità: URL>80%, provider>50%, count vicino a dichiarato
-   f. Se qualità OK → save_section
-   g. Se qualità scarsa → prova altro metodo
+   b. Leggi snapshot → CERCA bottone "Tutti"/"Tutte"/"All" → click se presente → wait → snapshot
+   c. Scegli metodo estrazione (vedi sotto)
+   d. Verifica qualità: URL>80%, provider>50%, count vicino a dichiarato
+   e. Se qualità OK → save_section
+   f. Se qualità scarsa → prova altro metodo
 3. Dopo TUTTE le sezioni → download_all
 
 ═══ STRATEGIE DI ESTRAZIONE (in ordine di priorità) ═══
@@ -78,10 +79,14 @@ Segnale: apis contiene JSON con array >100 elementi e campi game/name/title
 → Se mancano URL → cerca altra API tipo seodata/slug
 
 STRATEGIA C — HTML paginato (Eurobet/AEM)
-Segnale: apis contiene HTML con "htmlGames", oppure gameElements con data-gameid
-→ PRIMA: click "Tutti" se presente nei buttons
-→ POI: fetch_pages con URL base (es: /it/slot/tutti.more.0/, step=39)
-→ Se fetch_pages fallisce → prova scroll_all
+Segnale: gameElements>0 con data-gameid, oppure apis HTML con htmlGames, oppure paginationUrls
+IMPORTANTE — su Eurobet/AEM:
+1. SEMPRE clicca "Tutti"/"Tutte" PRIMA di tutto → aspetta → snapshot
+2. Per fetch_pages USA l'URL dalla sezione "tutti": /it/slot/tutti.more.0/ (NON /slot-machine.more.0/)
+3. Se vedi paginationUrls nello snapshot → USA QUELLE URL come base per fetch_pages
+4. Se gameElWithUrl mostra pochi URL (es "520/6066") → il DOM ha le card ma senza gamepath → fetch_pages è OBBLIGATORIO
+5. Step tipico: 39 per Eurobet. Se fallisce prova 20, 40, 50
+6. extract_games dal DOM funziona SOLO se gameElWithUrl è alto (>80%)
 
 STRATEGIA D — Scroll + DOM
 Segnale: gameElements > 0 ma < gameCounts
@@ -97,12 +102,21 @@ Segnale: nessuna API, nessun gameElement, ma pagina pesante
 
 - extract dà 0 giochi → HAI CLICCATO "TUTTI"? Se no, click prima. Poi riprova.
 - extract dà pochi giochi vs dichiarati → Prova strategia diversa (B→C→D)
-- Giochi senza URL (>50%) → Cerca API seodata/slug nelle apis. Oppure eval_js per cercare mappature URL.
+- Giochi senza URL (urlPct<50%) → NON fare scroll. Il DOM non ha gamepath. Usa fetch_pages con URL /tutti.more.0/
 - Giochi senza provider → Il metodo DOM non cattura provider. Prova extract_api o eval_js.
 - Pagina vuota dopo navigate → wait 5000, poi snapshot. Il sito potrebbe essere SPA lenta.
-- fetch_pages dà 0 → Prova step diverso: 20, 40, 50. Oppure URL diverso (/tutti/ vs /slot-machine/ ecc)
-- scroll_all si ferma presto → Il sito carica con AJAX lento. Usa fetch_pages invece.
-- Stessa azione ripetuta 3 volte → FERMATI. Usa ask_user per chiedere aiuto all'operatore.
+- fetch_pages dà pochi risultati → Controlla URL! Deve contenere "/tutti" non "/slot-machine". Prova anche step diversi: 20, 40, 50
+- fetch_pages dà 0 → URL completamente sbagliato. Guarda paginationUrls nello snapshot. Se non ci sono, naviga a /tutti/ e riprova.
+- scroll_all non aggiunge URL → Se gameElWithUrl è basso, scroll è INUTILE. Usa fetch_pages.
+- Stessa azione ripetuta → FERMATI. NON ripetere scroll_all o extract_games se già falliti. Prova strategia completamente diversa.
+- Niente funziona → ask_user con descrizione chiara del problema
+
+═══ IMPORTANTE: NON INVENTARE URL ═══
+Se devi fare fetch_pages:
+1. PRIMA controlla paginationUrls nello snapshot → usa quella URL
+2. Se non c'è, controlla apis per URL con .more. o page=
+3. Se non c'è, naviga alla pagina /tutti/ prima, poi fai snapshot per intercettare l'URL
+4. ULTIMA risorsa: costruisci da location.pathname MA assicurati che contenga "tutti"
 
 ═══ QUALITÀ MINIMA per save_section ═══
 - URL: almeno 70% dei giochi DEVE avere URL
