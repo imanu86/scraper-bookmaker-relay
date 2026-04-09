@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════
-//  Scraper Bookmaker Relay v7 — Claude vede la pagina, decide cosa fare
+//  Scraper Bookmaker Relay v8 — Strategie complete, recovery, qualità
 // ═══════════════════════════════════════════════════════════════════════
 
 const express = require('express');
@@ -18,52 +18,105 @@ if (!API_KEY) console.warn('⚠️ ANTHROPIC_API_KEY mancante');
 let agents = new Set();
 
 // ═══ SYSTEM PROMPT ═══
-const SYSTEM_PROMPT = `Sei un operatore che guida un agente browser per estrarre il catalogo giochi completo da siti di bookmaker italiani.
+const SYSTEM_PROMPT = `Sei un esperto scraper di cataloghi giochi per bookmaker italiani.
+Un agente browser ti manda SNAPSHOT della pagina. Tu analizzi e decidi l'azione giusta.
 
-L'agente ti manda SNAPSHOT della pagina: URL, link di navigazione, bottoni visibili, conteggi giochi, elementi nel DOM, API intercettate, variabili JS, giochi già estratti/salvati.
+═══ COMANDI (rispondi SOLO JSON, MAI testo) ═══
+{"reasoning":"max 20 parole","action":"COMANDO", ...params}
 
-Tu VEDI la pagina attraverso gli occhi dell'agente. Analizza lo snapshot e decidi L'AZIONE GIUSTA.
+click         {"action":"click","text":"Tutti"} o {"action":"click","selector":"css"}
+navigate      {"action":"navigate","value":"https://sito.it/casino/"}
+scroll_all    {"action":"scroll_all"}
+wait          {"action":"wait","ms":5000}
+snapshot      {"action":"snapshot"}
+extract_games {"action":"extract_games"}
+extract_api   {"action":"extract_api","value":"URL_API"}
+fetch_pages   {"action":"fetch_pages","value":"URL.more.0/","step":39}
+eval_js       {"action":"eval_js","value":"codice JS"}
+save_section  {"action":"save_section","value":"slot"}
+download_all  {"action":"download_all"}
+ask_user      {"action":"ask_user","value":"domanda"}
 
-COMANDI (rispondi SOLO JSON):
-{"reasoning":"max 20 parole","action":"COMANDO", ...parametri}
+═══ COME LEGGERE LO SNAPSHOT ═══
+url: pagina corrente
+nav: link navigazione → sezioni del sito (slot, casino, live)
+buttons: bottoni/tab cliccabili → se "Tutti" non attivo → CLICCA PRIMA
+gameCounts: numeri es [5806] → giochi dichiarati dal sito
+gameElements: giochi nel DOM ora → se << gameCounts → servono più giochi
+apis: API intercettate → JSON con array giochi = tesoro
+jsVars: variabili JS → casinoData = XCasino, piglia tutto con extract_games
+saved: sezioni salvate → NON rifare
+extracted: giochi estratti ora → controlla extractedDetail per qualità
+quality: {urls:N, providers:N, images:N} → se bassi = estrazione incompleta
 
-click       → {"action":"click","text":"Tutti"} o {"action":"click","selector":".btn-all"}
-navigate    → {"action":"navigate","value":"https://www.sito.it/casino/"}
-scroll_all  → {"action":"scroll_all"} — scrolla gradualmente per caricare tutti i giochi
-wait        → {"action":"wait","ms":5000} — aspetta che il contenuto carichi
-snapshot    → {"action":"snapshot"} — rileggimi la pagina
-extract_games → {"action":"extract_games"} — estrai giochi dal DOM (o da window.casinoData se presente)
-extract_api → {"action":"extract_api","value":"https://api.sito.it/games"} — fetcha un API JSON
-fetch_pages → {"action":"fetch_pages","value":"https://sito.it/slot/tutti.more.0/","step":39} — pagine HTML
-eval_js     → {"action":"eval_js","value":"window.casinoData.giochi.length"}
-save_section → {"action":"save_section","value":"slot"}
-download_all → {"action":"download_all"}
-ask_user    → {"action":"ask_user","value":"domanda per l'operatore"}
+═══ OBIETTIVO ═══
+Estrarre TUTTE le sezioni: slot, casino, casino-live. Ogni gioco DEVE avere: nome, URL, provider.
+IGNORA: sport, bingo, poker, lotterie, carte, ippica, virtuali.
 
-COME LEGGERE LO SNAPSHOT:
-- nav: link di navigazione → ti dice quali sezioni ha il sito (slot, casino, live)
-- buttons: bottoni/tab cliccabili → se vedi "Tutti"/"All" E gameElements è basso, CLICCA PRIMA
-- gameCounts: numeri tipo "5806 Giochi" → quanti giochi DICHIARA il sito
-- gameElements: quanti giochi sono nel DOM ORA → se molto meno di gameCounts, serve scroll o fetch_pages
-- apis: API intercettate → se c'è un JSON con array di giochi, usa extract_api
-- jsVars: variabili JS → se c'è casinoData, usa extract_games (lo fa automaticamente)
-- saved: sezioni già salvate → non rifare quelle già fatte
-- extracted: giochi già estratti → se >0, controlla urls e providers nel extractedDetail
+═══ FLUSSO STANDARD ═══
+1. Analizza snapshot iniziale → identifica sezioni dal nav
+2. Per OGNI sezione:
+   a. navigate alla sezione
+   b. Leggi snapshot → cerca bottone "Tutti"/"All" → click se presente
+   c. Aspetta (wait 3000) → snapshot
+   d. Scegli metodo estrazione (vedi sotto)
+   e. Verifica qualità: URL>80%, provider>50%, count vicino a dichiarato
+   f. Se qualità OK → save_section
+   g. Se qualità scarsa → prova altro metodo
+3. Dopo TUTTE le sezioni → download_all
 
-STRATEGIA:
-1. GUARDA i bottoni — se c'è "Tutti"/"Tutte le slot"/"All games" e NON è già attivo → click prima!
-2. GUARDA gameElements vs gameCounts — se pochi nel DOM → scroll_all o fetch_pages
-3. GUARDA jsVars — se c'è casinoData → extract_games (XCasino, piglia tutto subito)
-4. GUARDA apis — se c'è un JSON grosso con array → extract_api
-5. Dopo extract, GUARDA extractedDetail — se urls o providers sono bassi → il metodo è sbagliato, prova un altro
-6. Sezioni: slot → casino → casino-live → download_all
+═══ STRATEGIE DI ESTRAZIONE (in ordine di priorità) ═══
 
-REGOLE:
-- SOLO JSON, MAI testo o markdown
+STRATEGIA A — XCasino (NetBet, Domusbet, Staryes, DaznBet...)
+Segnale: jsVars contiene "casinoData"
+→ extract_games (legge window.casinoData.giochi automaticamente)
+→ Poi cerca seodata API per URL arricchiti
+
+STRATEGIA B — API JSON
+Segnale: apis contiene JSON con array >100 elementi e campi game/name/title
+→ extract_api con URL dell'API
+→ Se mancano URL → cerca altra API tipo seodata/slug
+
+STRATEGIA C — HTML paginato (Eurobet/AEM)
+Segnale: apis contiene HTML con "htmlGames", oppure gameElements con data-gameid
+→ PRIMA: click "Tutti" se presente nei buttons
+→ POI: fetch_pages con URL base (es: /it/slot/tutti.more.0/, step=39)
+→ Se fetch_pages fallisce → prova scroll_all
+
+STRATEGIA D — Scroll + DOM
+Segnale: gameElements > 0 ma < gameCounts
+→ PRIMA: click "Tutti" se presente
+→ scroll_all → poi extract_games
+→ Se non basta → fetch_pages come fallback
+
+STRATEGIA E — JS Variables
+Segnale: nessuna API, nessun gameElement, ma pagina pesante
+→ eval_js per cercare variabili: window.gameData, __NEXT_DATA__, __INITIAL_STATE__
+
+═══ RECOVERY — quando qualcosa non funziona ═══
+
+- extract dà 0 giochi → HAI CLICCATO "TUTTI"? Se no, click prima. Poi riprova.
+- extract dà pochi giochi vs dichiarati → Prova strategia diversa (B→C→D)
+- Giochi senza URL (>50%) → Cerca API seodata/slug nelle apis. Oppure eval_js per cercare mappature URL.
+- Giochi senza provider → Il metodo DOM non cattura provider. Prova extract_api o eval_js.
+- Pagina vuota dopo navigate → wait 5000, poi snapshot. Il sito potrebbe essere SPA lenta.
+- fetch_pages dà 0 → Prova step diverso: 20, 40, 50. Oppure URL diverso (/tutti/ vs /slot-machine/ ecc)
+- scroll_all si ferma presto → Il sito carica con AJAX lento. Usa fetch_pages invece.
+- Stessa azione ripetuta 3 volte → FERMATI. Usa ask_user per chiedere aiuto all'operatore.
+
+═══ QUALITÀ MINIMA per save_section ═══
+- URL: almeno 70% dei giochi DEVE avere URL
+- Provider: almeno 30% (alcuni siti non li espongono nel DOM)
+- Count: almeno 50% del dichiarato (se il sito dichiara 4200, servono almeno 2100)
+- Se non raggiungi la qualità → NON salvare, prova altro metodo o ask_user
+
+═══ REGOLE ASSOLUTE ═══
+- SOLO JSON, MAI markdown/testo
 - reasoning max 20 parole
-- Se non capisci la pagina → ask_user
-- NON salvare senza URL
-- Dopo ogni azione l'agente ti manda un nuovo snapshot — RILEGGILO prima di decidere`;
+- TUTTE e 3 le sezioni (slot, casino, casino-live) prima di download_all
+- Se una sezione ha <10 giochi sul sito → OK saltarla
+- MAI ripetere la stessa azione identica 2 volte di fila
+- Dopo OGNI azione ricevi nuovo snapshot → LEGGILO prima di decidere`;
 
 // ═══ KNOWLEDGE ═══
 let knowledge = [];
@@ -94,7 +147,7 @@ async function ask(host, msg, retry) {
     retry = retry || 0;
     const s = getSession(host); s.asks++; s.ts = Date.now();
     s.messages.push({ role: 'user', content: msg });
-    if (s.messages.length > 20) s.messages = s.messages.slice(-14);
+    if (s.messages.length > 24) s.messages = s.messages.slice(-18);
 
     const apiMsgs = s.messages.map((m, i) => i === 0 ? { role: m.role, content: [{ type: 'text', text: m.content, cache_control: { type: 'ephemeral' } }] } : m);
     const prompt = buildPrompt();
@@ -103,7 +156,7 @@ async function ask(host, msg, retry) {
 
     console.log(`[${host}] 🤖 #${s.asks} ~${est}tok`);
     try {
-        const body = JSON.stringify({ model: MODEL, max_tokens: 250, system: [{ type: 'text', text: prompt, cache_control: { type: 'ephemeral' } }], messages: apiMsgs });
+        const body = JSON.stringify({ model: MODEL, max_tokens: 300, system: [{ type: 'text', text: prompt, cache_control: { type: 'ephemeral' } }], messages: apiMsgs });
         const result = await new Promise((res, rej) => {
             const req = https.request({ hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'anthropic-beta': 'prompt-caching-2024-07-31', 'Content-Length': Buffer.byteLength(body) }
@@ -124,14 +177,13 @@ async function ask(host, msg, retry) {
             await new Promise(r => setTimeout(r, 15000 * (retry + 1)));
             return ask(host, msg, retry + 1);
         }
-        return JSON.stringify({ reasoning: 'Errore API, chiedo aiuto', action: 'ask_user', value: 'Errore API Claude: ' + e.message.substring(0, 100) });
+        return JSON.stringify({ reasoning: 'Errore API', action: 'ask_user', value: 'Errore API: ' + e.message.substring(0, 80) });
     }
 }
 
 function parse(text) {
     text = (text || '').replace(/```json\s*/g, '').replace(/```/g, '').trim();
     try { const p = JSON.parse(text); if (p?.action) return p; } catch (e) {}
-    // Try to find JSON in text
     for (let i = 0; i < text.length; i++) {
         if (text[i] !== '{') continue;
         let d = 0;
@@ -140,19 +192,10 @@ function parse(text) {
     return null;
 }
 
-// ═══ HANDLE ═══
 async function handle(ws, msg) {
     const host = msg.host || '?';
     if (!API_KEY) { ws.send(JSON.stringify({ type: 'error', message: 'API KEY mancante' })); return; }
-
-    // Build message from snapshot
-    let content;
-    if (msg.snapshot) {
-        content = 'SNAPSHOT:\n' + JSON.stringify(msg.snapshot, null, 1);
-    } else {
-        content = msg.diagnostic || msg.report || JSON.stringify(msg);
-    }
-
+    let content = msg.snapshot ? JSON.stringify(msg.snapshot, null, 1) : (msg.diagnostic || JSON.stringify(msg));
     const text = await ask(host, content);
     const action = parse(text);
     if (action) ws.send(JSON.stringify({ type: 'action', ...action }));
@@ -164,7 +207,7 @@ app.use(express.json());
 app.get('/', (req, res) => {
     const ss = {}; sessions.forEach((s, h) => { ss[h] = { asks: s.asks, msgs: s.messages.length, tokens: s.tokens,
         cost: `$${((s.tokens.i / 1e6) * 3 + (s.tokens.o / 1e6) * 15 + (s.tokens.cr / 1e6) * 0.3 + (s.tokens.cw / 1e6) * 3.75).toFixed(4)}` }; });
-    res.json({ v: 7, model: MODEL, agents: agents.size, knowledge: knowledge.length, sessions: ss });
+    res.json({ v: 8, model: MODEL, agents: agents.size, knowledge: knowledge.length, sessions: ss });
 });
 app.get('/sessions/:h/chat', (req, res) => { const s = sessions.get(req.params.h); res.json(s ? s.messages : []); });
 app.delete('/sessions', (req, res) => { sessions.clear(); res.json({ ok: 1 }); });
@@ -179,8 +222,8 @@ wss.on('connection', (ws) => {
     ws.on('message', async (raw) => {
         try {
             const msg = JSON.parse(raw);
-            if (msg.type === 'register') { agents.add(ws); ws.send(JSON.stringify({ type: 'registered', v: 7 })); return; }
-            if (msg.type === 'snapshot' || msg.type === 'diagnostic') { handle(ws, msg); return; }
+            if (msg.type === 'register') { agents.add(ws); ws.send(JSON.stringify({ type: 'registered', v: 8 })); return; }
+            if (msg.type === 'snapshot') { handle(ws, msg); return; }
             if (msg.type === 'user_feedback') { const t = await ask(msg.host || '?', `[OPERATORE]: ${msg.feedback}`); const a = parse(t); if (a) ws.send(JSON.stringify({ type: 'action', ...a })); return; }
             if (msg.type === 'user_answer') { const t = await ask(msg.host || '?', `[RISPOSTA]: ${msg.answer}`); const a = parse(t); if (a) ws.send(JSON.stringify({ type: 'action', ...a })); return; }
         } catch (e) { console.error('[err]', e.message); }
@@ -190,4 +233,4 @@ wss.on('connection', (ws) => {
 setInterval(() => { wss.clients.forEach(ws => { if (!ws.isAlive) return ws.terminate(); ws.isAlive = false; ws.ping(); }); }, 30000);
 setInterval(() => { const cut = Date.now() - 7200000; sessions.forEach((s, h) => { if (s.ts < cut) sessions.delete(h); }); }, 300000);
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => { console.log(`Relay v7 :${PORT}`); });
+server.listen(PORT, () => { console.log(`Relay v8 :${PORT}`); });
