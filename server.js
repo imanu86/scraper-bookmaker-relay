@@ -1,250 +1,190 @@
 // ═══════════════════════════════════════════════════════════════════════
-//  Scraper Bookmaker Relay v8 — Strategie complete, recovery, qualità
+//  Scraper Bookmaker Relay v9 — Railway WebSocket server
+//  Ponte tra Agent TM (bookmaker) ↔ Bridge TM (claude.ai) ↔ Controller (Managed Agent)
+//
+//  Novità v9: HTTP endpoints per remote fetch via TM browser
+//    POST /fetch       {url, headers?}   → TM fetcha con IP italiano → ritorna HTML
+//    POST /fetch-multi {urls: [...]}     → fetch paralleli
+//    GET  /queue                         → mostra coda pendente
+//
+//  Deploy: Railway, set PORT env var
+//  npm init -y && npm install ws express
 // ═══════════════════════════════════════════════════════════════════════
 
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const http = require('http');
-const https = require('https');
+const crypto = require('crypto');
 
 const app = express();
+app.use(express.json({ limit: '5mb' }));
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, maxPayload: 2 * 1024 * 1024 });
+const wss = new WebSocketServer({ server, maxPayload: 5 * 1024 * 1024 }); // 5MB
 
-const API_KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL = 'claude-sonnet-4-20250514';
-if (!API_KEY) console.warn('⚠️ ANTHROPIC_API_KEY mancante');
-
+// ─── State ───
 let agents = new Set();
+let activeAgent = null;
+let bridge = null;
 
-// ═══ SYSTEM PROMPT ═══
-const SYSTEM_PROMPT = `Sei un esperto scraper di cataloghi giochi per bookmaker italiani.
-Un agente browser ti manda SNAPSHOT della pagina. Tu analizzi e decidi l'azione giusta.
+// ─── Fetch Queue ───
+const fetchQueue = new Map();   // id → { url, resolve, timer, result }
+const FETCH_TIMEOUT = 30000;    // 30s
 
-═══ COMANDI (rispondi SOLO JSON, MAI testo) ═══
-{"reasoning":"max 20 parole","action":"COMANDO", ...params}
-
-click         {"action":"click","text":"Tutti"} o {"action":"click","selector":"css"}
-navigate      {"action":"navigate","value":"https://sito.it/casino/"}
-scroll_all    {"action":"scroll_all"}
-wait          {"action":"wait","ms":5000}
-snapshot      {"action":"snapshot"}
-extract_games {"action":"extract_games"}
-extract_api   {"action":"extract_api","value":"URL_API"}
-fetch_pages   {"action":"fetch_pages","value":"URL.more.0/","step":39}
-eval_js       {"action":"eval_js","value":"codice JS"}
-save_section  {"action":"save_section","value":"slot"}
-download_all  {"action":"download_all"}
-ask_user      {"action":"ask_user","value":"domanda"}
-
-═══ COME LEGGERE LO SNAPSHOT ═══
-url: pagina corrente
-nav: link navigazione → sezioni del sito (slot, casino, live)
-buttons: bottoni/tab cliccabili → se "Tutti" non attivo → CLICCA PRIMA
-gameCounts: numeri es [5806] → giochi dichiarati dal sito
-gameElements: giochi nel DOM ora → se << gameCounts → servono più giochi
-gameElWithUrl: es "520/6066" → quanti gameElements hanno anche URL (data-gamepath). Se basso = il DOM carica le card ma senza URL
-apis: API intercettate → JSON con array giochi = tesoro
-paginationUrls: URL con .more.N/ o page= intercettati dal browser → USA QUESTI per fetch_pages, NON inventare URL!
-jsVars: variabili JS → casinoData = XCasino, piglia tutto con extract_games
-saved: sezioni salvate → NON rifare
-extracted: giochi estratti ora → controlla quality per qualità
-quality: {urls:N, providers:N, total:N, urlPct:"49%"} → se urlPct basso = estrazione incompleta
-
-═══ OBIETTIVO ═══
-Estrarre TUTTE le sezioni: slot, casino, casino-live. Ogni gioco DEVE avere: nome, URL, provider.
-IGNORA: sport, bingo, poker, lotterie, carte, ippica, virtuali.
-
-═══ FLUSSO STANDARD ═══
-1. Analizza snapshot iniziale → identifica sezioni dal nav
-2. Per OGNI sezione:
-   a. navigate alla sezione
-   b. Leggi snapshot → CERCA bottone "Tutti"/"Tutte"/"All" → click se presente → wait → snapshot
-   c. Scegli metodo estrazione (vedi sotto)
-   d. Verifica qualità: URL>80%, provider>50%, count vicino a dichiarato
-   e. Se qualità OK → save_section
-   f. Se qualità scarsa → prova altro metodo
-3. Dopo TUTTE le sezioni → download_all
-
-═══ STRATEGIE DI ESTRAZIONE (in ordine di priorità) ═══
-
-STRATEGIA A — XCasino (NetBet, Domusbet, Staryes, DaznBet...)
-Segnale: jsVars contiene "casinoData"
-→ extract_games (legge window.casinoData.giochi automaticamente)
-→ Poi cerca seodata API per URL arricchiti
-
-STRATEGIA B — API JSON
-Segnale: apis contiene JSON con array >100 elementi e campi game/name/title
-→ extract_api con URL dell'API
-→ Se mancano URL → cerca altra API tipo seodata/slug
-
-STRATEGIA C — HTML paginato (Eurobet/AEM)
-Segnale: gameElements>0 con data-gameid, oppure apis HTML con htmlGames, oppure paginationUrls
-IMPORTANTE — su Eurobet/AEM:
-1. SEMPRE clicca "Tutti"/"Tutte" PRIMA di tutto → aspetta → snapshot
-2. Per fetch_pages USA l'URL dalla sezione "tutti": /it/slot/tutti.more.0/ (NON /slot-machine.more.0/)
-3. Se vedi paginationUrls nello snapshot → USA QUELLE URL come base per fetch_pages
-4. Se gameElWithUrl mostra pochi URL (es "520/6066") → il DOM ha le card ma senza gamepath → fetch_pages è OBBLIGATORIO
-5. Step tipico: 39 per Eurobet. Se fallisce prova 20, 40, 50
-6. extract_games dal DOM funziona SOLO se gameElWithUrl è alto (>80%)
-
-STRATEGIA D — Scroll + DOM
-Segnale: gameElements > 0 ma < gameCounts
-→ PRIMA: click "Tutti" se presente
-→ scroll_all → poi extract_games
-→ Se non basta → fetch_pages come fallback
-
-STRATEGIA E — JS Variables
-Segnale: nessuna API, nessun gameElement, ma pagina pesante
-→ eval_js per cercare variabili: window.gameData, __NEXT_DATA__, __INITIAL_STATE__
-
-═══ RECOVERY — quando qualcosa non funziona ═══
-
-- extract dà 0 giochi → HAI CLICCATO "TUTTI"? Se no, click prima. Poi riprova.
-- extract dà pochi giochi vs dichiarati → Prova strategia diversa (B→C→D)
-- Giochi senza URL (urlPct<50%) → NON fare scroll. Il DOM non ha gamepath. Usa fetch_pages con URL /tutti.more.0/
-- Giochi senza provider → Il metodo DOM non cattura provider. Prova extract_api o eval_js.
-- Pagina vuota dopo navigate → wait 5000, poi snapshot. Il sito potrebbe essere SPA lenta.
-- fetch_pages dà pochi risultati → Controlla URL! Deve contenere "/tutti" non "/slot-machine". Prova anche step diversi: 20, 40, 50
-- fetch_pages dà 0 → URL completamente sbagliato. Guarda paginationUrls nello snapshot. Se non ci sono, naviga a /tutti/ e riprova.
-- scroll_all non aggiunge URL → Se gameElWithUrl è basso, scroll è INUTILE. Usa fetch_pages.
-- Stessa azione ripetuta → FERMATI. NON ripetere scroll_all o extract_games se già falliti. Prova strategia completamente diversa.
-- Niente funziona → ask_user con descrizione chiara del problema
-
-═══ IMPORTANTE: NON INVENTARE URL ═══
-Se devi fare fetch_pages:
-1. PRIMA controlla paginationUrls nello snapshot → usa quella URL
-2. Se non c'è, controlla apis per URL con .more. o page=
-3. Se non c'è, naviga alla pagina /tutti/ prima, poi fai snapshot per intercettare l'URL
-4. ULTIMA risorsa: costruisci da location.pathname MA assicurati che contenga "tutti"
-
-═══ QUALITÀ MINIMA per save_section ═══
-- URL: almeno 70% dei giochi DEVE avere URL
-- Provider: almeno 30% (alcuni siti non li espongono nel DOM)
-- Count: almeno 50% del dichiarato (se il sito dichiara 4200, servono almeno 2100)
-- Se non raggiungi la qualità → NON salvare, prova altro metodo o ask_user
-
-═══ REGOLE ASSOLUTE ═══
-- SOLO JSON, MAI markdown/testo
-- reasoning max 20 parole
-- TUTTE e 3 le sezioni (slot, casino, casino-live) prima di download_all
-- Se una sezione ha <10 giochi sul sito → OK saltarla
-- MAI ripetere la stessa azione identica 2 volte di fila
-- Dopo OGNI azione ricevi nuovo snapshot → LEGGILO prima di decidere`;
-
-// ═══ KNOWLEDGE ═══
-let knowledge = [];
-function buildPrompt() {
-    let p = SYSTEM_PROMPT;
-    if (knowledge.length) p += '\n\nCONOSCENZE APPRESE:\n' + knowledge.map((k, i) => `${i + 1}. ${k.pattern}`).join('\n');
-    return p;
-}
-
-// ═══ SESSION + RATE LIMIT ═══
-const sessions = new Map();
-function getSession(h) { if (!sessions.has(h)) sessions.set(h, { host: h, ts: Date.now(), messages: [], asks: 0, tokens: { i: 0, o: 0, cr: 0, cw: 0 } }); return sessions.get(h); }
-
-const rl = {
-    log: [], MAX: 40000, MIN: 3000, last: 0,
-    async wait(est) {
-        const now = Date.now(); this.log = this.log.filter(e => now - e.t < 60000);
-        const u = this.log.reduce((s, e) => s + e.n, 0);
-        if (u + est > this.MAX) await new Promise(r => setTimeout(r, 60000 - (now - (this.log[0]?.t || now)) + 1000));
-        if (now - this.last < this.MIN) await new Promise(r => setTimeout(r, this.MIN - (now - this.last)));
-        this.last = Date.now();
-    },
-    add(n) { this.log.push({ t: Date.now(), n }); }
-};
-
-// ═══ CLAUDE API ═══
-async function ask(host, msg, retry) {
-    retry = retry || 0;
-    const s = getSession(host); s.asks++; s.ts = Date.now();
-    s.messages.push({ role: 'user', content: msg });
-    if (s.messages.length > 24) s.messages = s.messages.slice(-18);
-
-    const apiMsgs = s.messages.map((m, i) => i === 0 ? { role: m.role, content: [{ type: 'text', text: m.content, cache_control: { type: 'ephemeral' } }] } : m);
-    const prompt = buildPrompt();
-    const est = Math.round((prompt.length + s.messages.reduce((a, m) => a + m.content.length, 0)) / 4);
-    await rl.wait(est);
-
-    console.log(`[${host}] 🤖 #${s.asks} ~${est}tok`);
-    try {
-        const body = JSON.stringify({ model: MODEL, max_tokens: 300, system: [{ type: 'text', text: prompt, cache_control: { type: 'ephemeral' } }], messages: apiMsgs });
-        const result = await new Promise((res, rej) => {
-            const req = https.request({ hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'anthropic-beta': 'prompt-caching-2024-07-31', 'Content-Length': Buffer.byteLength(body) }
-            }, r => { let d = ''; r.on('data', c => d += c); r.on('end', () => { if (r.statusCode !== 200) rej(new Error(`${r.statusCode}: ${d.substring(0, 200)}`)); else try { res(JSON.parse(d)); } catch (e) { rej(e); } }); });
-            req.on('error', rej); req.write(body); req.end();
-        });
-        const text = result.content?.[0]?.text || '';
-        rl.add((result.usage?.input_tokens || est) + (result.usage?.output_tokens || 0));
-        if (result.usage) { s.tokens.i += result.usage.input_tokens || 0; s.tokens.o += result.usage.output_tokens || 0; s.tokens.cr += result.usage.cache_read_input_tokens || 0; s.tokens.cw += result.usage.cache_creation_input_tokens || 0; }
-        s.messages.push({ role: 'assistant', content: text });
-        console.log(`[${host}] ✅ ${text.substring(0, 120)}`);
-        return text;
-    } catch (e) {
-        console.error(`[${host}] ❌ ${e.message}`);
-        if (s.messages.length && s.messages[s.messages.length - 1].role === 'user') s.messages.pop();
-        if ((e.message.includes('429') || e.message.includes('529')) && retry < 3) {
-            console.log(`[${host}] 🔄 Retry ${retry + 1}`); s.asks--;
-            await new Promise(r => setTimeout(r, 15000 * (retry + 1)));
-            return ask(host, msg, retry + 1);
-        }
-        return JSON.stringify({ reasoning: 'Errore API', action: 'ask_user', value: 'Errore API: ' + e.message.substring(0, 80) });
-    }
-}
-
-function parse(text) {
-    text = (text || '').replace(/```json\s*/g, '').replace(/```/g, '').trim();
-    try { const p = JSON.parse(text); if (p?.action) return p; } catch (e) {}
-    for (let i = 0; i < text.length; i++) {
-        if (text[i] !== '{') continue;
-        let d = 0;
-        for (let j = i; j < text.length; j++) { if (text[j] === '{') d++; if (text[j] === '}') d--; if (d === 0) { try { const p = JSON.parse(text.substring(i, j + 1)); if (p?.action) return p; } catch (e) {} break; } }
-    }
-    return null;
-}
-
-async function handle(ws, msg) {
-    const host = msg.host || '?';
-    if (!API_KEY) { ws.send(JSON.stringify({ type: 'error', message: 'API KEY mancante' })); return; }
-    let content = msg.snapshot ? JSON.stringify(msg.snapshot, null, 1) : (msg.diagnostic || JSON.stringify(msg));
-    const text = await ask(host, content);
-    const action = parse(text);
-    if (action) ws.send(JSON.stringify({ type: 'action', ...action }));
-    else ws.send(JSON.stringify({ type: 'error', message: 'Non parsabile: ' + text.substring(0, 150) }));
-}
-
-// ═══ HTTP ═══
-app.use(express.json());
+// ─── Health endpoint ───
 app.get('/', (req, res) => {
-    const ss = {}; sessions.forEach((s, h) => { ss[h] = { asks: s.asks, msgs: s.messages.length, tokens: s.tokens,
-        cost: `$${((s.tokens.i / 1e6) * 3 + (s.tokens.o / 1e6) * 15 + (s.tokens.cr / 1e6) * 0.3 + (s.tokens.cw / 1e6) * 3.75).toFixed(4)}` }; });
-    res.json({ v: 8, model: MODEL, agents: agents.size, knowledge: knowledge.length, sessions: ss });
+    res.json({
+        status: 'ok',
+        service: 'scraper-bookmaker-relay v9',
+        agent: agents.size + ' connected',
+        bridge: bridge ? 'connected' : 'disconnected',
+        fetchQueue: fetchQueue.size + ' pending',
+        uptime: Math.round(process.uptime()) + 's'
+    });
 });
-app.get('/sessions/:h/chat', (req, res) => { const s = sessions.get(req.params.h); res.json(s ? s.messages : []); });
-app.delete('/sessions', (req, res) => { sessions.clear(); res.json({ ok: 1 }); });
-app.delete('/sessions/:h', (req, res) => { sessions.delete(req.params.h); res.json({ ok: 1 }); });
-app.get('/knowledge', (req, res) => res.json(knowledge));
-app.post('/knowledge', (req, res) => { if (!req.body.pattern) return res.status(400).json({ err: 1 }); knowledge.push({ pattern: req.body.pattern, ts: Date.now() }); res.json({ ok: 1 }); });
-app.delete('/knowledge', (req, res) => { knowledge = []; res.json({ ok: 1 }); });
 
-// ═══ WS ═══
-wss.on('connection', (ws) => {
-    ws.isAlive = true; ws.on('pong', () => { ws.isAlive = true; });
-    ws.on('message', async (raw) => {
+// ─── GET /queue ───
+app.get('/queue', (req, res) => {
+    const items = [];
+    fetchQueue.forEach((v, id) => items.push({ id, url: v.url, hasResult: !!v.result, ts: v.ts }));
+    res.json({ queue: items, agents: agents.size });
+});
+
+// ─── POST /fetch — singolo URL via TM browser ───
+app.post('/fetch', (req, res) => {
+    const { url, headers } = req.body;
+    if (!url) return res.status(400).json({ error: 'url required' });
+
+    let targetAgent = null;
+    for (const a of agents) { if (a.readyState === 1) { targetAgent = a; break; } }
+    if (!targetAgent) return res.status(503).json({ error: 'No TM agent connected' });
+
+    const id = crypto.randomUUID();
+    console.log(`[fetch] ${id} → ${url}`);
+
+    targetAgent.send(JSON.stringify({ type: 'fetch_request', id, url, headers: headers || {} }));
+
+    const timer = setTimeout(() => {
+        if (fetchQueue.has(id)) {
+            fetchQueue.delete(id);
+            res.status(504).json({ error: 'Timeout', id, url });
+        }
+    }, FETCH_TIMEOUT);
+
+    fetchQueue.set(id, {
+        url, ts: Date.now(), timer,
+        resolve: (result) => { clearTimeout(timer); fetchQueue.delete(id); res.json(result); }
+    });
+});
+
+// ─── POST /fetch-multi — fetch multipli in parallelo ───
+app.post('/fetch-multi', (req, res) => {
+    const { urls } = req.body;
+    if (!urls || !Array.isArray(urls)) return res.status(400).json({ error: 'urls array required' });
+
+    let targetAgent = null;
+    for (const a of agents) { if (a.readyState === 1) { targetAgent = a; break; } }
+    if (!targetAgent) return res.status(503).json({ error: 'No TM agent connected' });
+
+    const results = {};
+    let remaining = urls.length;
+
+    const timer = setTimeout(() => {
+        fetchQueue.forEach((v, id) => { if (urls.includes(v.url)) fetchQueue.delete(id); });
+        res.json({ results, complete: false, timedOut: remaining });
+    }, FETCH_TIMEOUT);
+
+    urls.forEach(url => {
+        const id = crypto.randomUUID();
+        console.log(`[fetch-multi] ${id} → ${url}`);
+        targetAgent.send(JSON.stringify({ type: 'fetch_request', id, url, headers: {} }));
+        fetchQueue.set(id, {
+            url, ts: Date.now(),
+            resolve: (result) => {
+                results[url] = result;
+                remaining--;
+                fetchQueue.delete(id);
+                if (remaining <= 0) { clearTimeout(timer); res.json({ results, complete: true }); }
+            }
+        });
+    });
+});
+
+// ─── WebSocket ───
+wss.on('connection', (ws, req) => {
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    console.log(`[+] Connessione da ${ip}`);
+
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
+
+    ws.on('message', (raw) => {
         try {
             const msg = JSON.parse(raw);
-            if (msg.type === 'register') { agents.add(ws); ws.send(JSON.stringify({ type: 'registered', v: 8 })); return; }
-            if (msg.type === 'snapshot') { handle(ws, msg); return; }
-            if (msg.type === 'user_feedback') { const t = await ask(msg.host || '?', `[OPERATORE]: ${msg.feedback}`); const a = parse(t); if (a) ws.send(JSON.stringify({ type: 'action', ...a })); return; }
-            if (msg.type === 'user_answer') { const t = await ask(msg.host || '?', `[RISPOSTA]: ${msg.answer}`); const a = parse(t); if (a) ws.send(JSON.stringify({ type: 'action', ...a })); return; }
-        } catch (e) { console.error('[err]', e.message); }
+
+            // Registrazione
+            if (msg.type === 'register') {
+                if (msg.role === 'agent') {
+                    agents.add(ws);
+                    ws._role = 'agent';
+                    console.log(`[agent] Registrato (${agents.size})`);
+                    ws.send(JSON.stringify({ type: 'registered', role: 'agent', bridge: bridge ? 'online' : 'offline' }));
+                } else if (msg.role === 'bridge') {
+                    bridge = ws;
+                    ws._role = 'bridge';
+                    console.log('[bridge] Registrato');
+                    ws.send(JSON.stringify({ type: 'registered', role: 'bridge' }));
+                }
+                return;
+            }
+
+            // ─── Risposta fetch dal TM → resolve HTTP pending ───
+            if (ws._role === 'agent' && msg.type === 'fetch_response') {
+                const entry = fetchQueue.get(msg.id);
+                if (entry) {
+                    console.log(`[fetch] ${msg.id} ← ${msg.status} (${(msg.html || '').length}B)`);
+                    entry.resolve({
+                        id: msg.id, url: msg.url, status: msg.status,
+                        html: msg.html, size: (msg.html || '').length,
+                        finalUrl: msg.finalUrl || msg.url
+                    });
+                }
+                return;
+            }
+
+            // Forward: agent → bridge
+            if (ws._role === 'agent' && msg.type === 'need_help') {
+                activeAgent = ws;
+                if (bridge && bridge.readyState === 1) bridge.send(JSON.stringify(msg));
+                else ws.send(JSON.stringify({ type: 'error', message: 'Bridge non connesso' }));
+                return;
+            }
+
+            // Forward: bridge → agent
+            if (ws._role === 'bridge' && msg.type === 'action') {
+                if (activeAgent && activeAgent.readyState === 1) activeAgent.send(JSON.stringify(msg));
+                return;
+            }
+
+            if (msg.type === 'ping') { ws.send(JSON.stringify({ type: 'pong', ts: Date.now() })); return; }
+
+        } catch (e) { console.error('[error]', e.message); }
     });
-    ws.on('close', () => { agents.delete(ws); });
+
+    ws.on('close', () => {
+        if (ws._role === 'agent') { agents.delete(ws); if (ws === activeAgent) activeAgent = null; }
+        if (ws === bridge) bridge = null;
+    });
 });
-setInterval(() => { wss.clients.forEach(ws => { if (!ws.isAlive) return ws.terminate(); ws.isAlive = false; ws.ping(); }); }, 30000);
-setInterval(() => { const cut = Date.now() - 7200000; sessions.forEach((s, h) => { if (s.ts < cut) sessions.delete(h); }); }, 300000);
+
+// ─── Heartbeat ───
+setInterval(() => {
+    wss.clients.forEach(ws => {
+        if (!ws.isAlive) return ws.terminate();
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 30000);
+
+// ─── Start ───
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => { console.log(`Relay v8 :${PORT}`); });
+server.listen(PORT, () => console.log(`Scraper Bookmaker Relay v9 on :${PORT}`));
