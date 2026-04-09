@@ -17,7 +17,7 @@ const http = require('http');
 const crypto = require('crypto');
 
 const app = express();
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '10mb' }));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, maxPayload: 5 * 1024 * 1024 }); // 5MB
 
@@ -30,14 +30,18 @@ let bridge = null;
 const fetchQueue = new Map();   // id → { url, resolve, timer, result }
 const FETCH_TIMEOUT = 30000;    // 30s
 
+// ─── Catalog Storage (in-memory) ───
+const catalogs = new Map();     // site → { data, ts, count }
+
 // ─── Health endpoint ───
 app.get('/', (req, res) => {
     res.json({
         status: 'ok',
-        service: 'scraper-bookmaker-relay v9',
+        service: 'scraper-bookmaker-relay v10',
         agent: agents.size + ' connected',
         bridge: bridge ? 'connected' : 'disconnected',
         fetchQueue: fetchQueue.size + ' pending',
+        catalogs: catalogs.size + ' saved',
         uptime: Math.round(process.uptime()) + 's'
     });
 });
@@ -47,6 +51,34 @@ app.get('/queue', (req, res) => {
     const items = [];
     fetchQueue.forEach((v, id) => items.push({ id, url: v.url, hasResult: !!v.result, ts: v.ts }));
     res.json({ queue: items, agents: agents.size });
+});
+
+// ─── POST /catalog/:site — agent salva un catalogo ───
+app.post('/catalog/:site', (req, res) => {
+    const site = req.params.site;
+    const data = req.body;
+    if (!data || (!Array.isArray(data) && !data.games)) {
+        return res.status(400).json({ error: 'JSON array or {games:[...]} required' });
+    }
+    const games = Array.isArray(data) ? data : data.games;
+    catalogs.set(site, { data: games, ts: Date.now(), count: games.length });
+    console.log(`[catalog] ${site}: ${games.length} giochi salvati`);
+    res.json({ ok: true, site, count: games.length });
+});
+
+// ─── GET /catalog/:site — scarica catalogo come JSON ───
+app.get('/catalog/:site', (req, res) => {
+    const entry = catalogs.get(req.params.site);
+    if (!entry) return res.status(404).json({ error: 'Catalog not found' });
+    res.setHeader('Content-Disposition', `attachment; filename="${req.params.site}_catalog.json"`);
+    res.json(entry.data);
+});
+
+// ─── GET /catalogs — lista tutti i cataloghi salvati ───
+app.get('/catalogs', (req, res) => {
+    const list = [];
+    catalogs.forEach((v, site) => list.push({ site, count: v.count, ts: new Date(v.ts).toISOString() }));
+    res.json({ catalogs: list, total: list.reduce((s, c) => s + c.count, 0) });
 });
 
 // ─── POST /fetch — singolo URL via TM browser ───
@@ -187,4 +219,4 @@ setInterval(() => {
 
 // ─── Start ───
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Scraper Bookmaker Relay v9 on :${PORT}`));
+server.listen(PORT, () => console.log(`Scraper Bookmaker Relay v10 on :${PORT}`));
