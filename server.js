@@ -1,11 +1,14 @@
 // ═══════════════════════════════════════════════════════════════════════
-//  Scraper Bookmaker Relay v9 — Railway WebSocket server
-//  Ponte tra Agent TM (bookmaker) ↔ Bridge TM (claude.ai) ↔ Controller (Managed Agent)
+//  Scraper Bookmaker Relay v11 — Railway WebSocket server
 //
-//  Novità v9: HTTP endpoints per remote fetch via TM browser
-//    POST /fetch       {url, headers?}   → TM fetcha con IP italiano → ritorna HTML
-//    POST /fetch-multi {urls: [...]}     → fetch paralleli
-//    GET  /queue                         → mostra coda pendente
+//  Canali coesistenti, indipendenti:
+//   1) SCRAPER  — agent (TM bookmaker) ↔ bridge (TM claude.ai)        [v10, intatto]
+//   2) FETCH    — HTTP /fetch /fetch-multi via TM browser              [v10, intatto]
+//   3) CATALOG  — HTTP /catalog/:site                                  [v10, intatto]
+//   4) TRADE    — adp_producer (TM ADP) ↔ tv_consumer (TM TradingView) [NUOVO]
+//
+//  Il routing trade è per `userKey`: producer e consumer con la stessa
+//  key vengono accoppiati. I canali non si parlano tra loro.
 //
 //  Deploy: Railway, set PORT env var
 //  npm init -y && npm install ws express
@@ -21,27 +24,47 @@ app.use(express.json({ limit: '10mb' }));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, maxPayload: 5 * 1024 * 1024 }); // 5MB
 
-// ─── State ───
+// ─── State: SCRAPER (legacy v10) ───
 let agents = new Set();
 let activeAgent = null;
 let bridge = null;
 
-// ─── Fetch Queue ───
+// ─── Fetch Queue (v10) ───
 const fetchQueue = new Map();   // id → { url, resolve, timer, result }
 const FETCH_TIMEOUT = 30000;    // 30s
 
-// ─── Catalog Storage (in-memory) ───
+// ─── Catalog Storage in-memory (v10) ───
 const catalogs = new Map();     // site → { data, ts, count }
+
+// ─── State: TRADE (v11) ───
+// userKey → { producer: ws|null, consumers: Set<ws> }
+const tradeChannels = new Map();
+function getOrCreateChannel(key) {
+    let ch = tradeChannels.get(key);
+    if (!ch) { ch = { producer: null, consumers: new Set() }; tradeChannels.set(key, ch); }
+    return ch;
+}
+function pruneChannel(key) {
+    const ch = tradeChannels.get(key);
+    if (ch && !ch.producer && ch.consumers.size === 0) tradeChannels.delete(key);
+}
 
 // ─── Health endpoint ───
 app.get('/', (req, res) => {
+    const tradeDetail = [];
+    tradeChannels.forEach((ch, key) => tradeDetail.push({
+        userKey: key,
+        producer: ch.producer ? 'online' : 'offline',
+        consumers: ch.consumers.size
+    }));
     res.json({
         status: 'ok',
-        service: 'scraper-bookmaker-relay v10',
+        service: 'scraper-bookmaker-relay v11',
         agent: agents.size + ' connected',
         bridge: bridge ? 'connected' : 'disconnected',
         fetchQueue: fetchQueue.size + ' pending',
         catalogs: catalogs.size + ' saved',
+        trade: { channels: tradeChannels.size, detail: tradeDetail },
         uptime: Math.round(process.uptime()) + 's'
     });
 });
@@ -153,23 +176,78 @@ wss.on('connection', (ws, req) => {
         try {
             const msg = JSON.parse(raw);
 
-            // Registrazione
+            // ═══════════════════════════════════════════════════════════
+            //  REGISTRAZIONE
+            // ═══════════════════════════════════════════════════════════
             if (msg.type === 'register') {
+
+                // ── SCRAPER: agent ──
                 if (msg.role === 'agent') {
                     agents.add(ws);
                     ws._role = 'agent';
                     console.log(`[agent] Registrato (${agents.size})`);
                     ws.send(JSON.stringify({ type: 'registered', role: 'agent', bridge: bridge ? 'online' : 'offline' }));
-                } else if (msg.role === 'bridge') {
+                    return;
+                }
+
+                // ── SCRAPER: bridge ──
+                if (msg.role === 'bridge') {
                     bridge = ws;
                     ws._role = 'bridge';
                     console.log('[bridge] Registrato');
                     ws.send(JSON.stringify({ type: 'registered', role: 'bridge' }));
+                    return;
                 }
+
+                // ── TRADE: adp_producer ──
+                if (msg.role === 'adp_producer') {
+                    const key = (msg.userKey || '').trim() || 'default';
+                    ws._role = 'adp_producer';
+                    ws._userKey = key;
+                    const ch = getOrCreateChannel(key);
+                    if (ch.producer && ch.producer !== ws && ch.producer.readyState === 1) {
+                        try { ch.producer.send(JSON.stringify({ type: 'evicted', reason: 'replaced by newer producer' })); } catch {}
+                        try { ch.producer.close(); } catch {}
+                    }
+                    ch.producer = ws;
+                    console.log(`[adp_producer] registrato (userKey=${key}, consumers=${ch.consumers.size})`);
+                    ws.send(JSON.stringify({
+                        type: 'registered', role: 'adp_producer', userKey: key,
+                        consumers: ch.consumers.size
+                    }));
+                    ch.consumers.forEach(c => {
+                        if (c.readyState === 1) c.send(JSON.stringify({ type: 'peer_status', peer: 'producer', status: 'online' }));
+                    });
+                    return;
+                }
+
+                // ── TRADE: tv_consumer ──
+                if (msg.role === 'tv_consumer') {
+                    const key = (msg.userKey || '').trim() || 'default';
+                    ws._role = 'tv_consumer';
+                    ws._userKey = key;
+                    const ch = getOrCreateChannel(key);
+                    ch.consumers.add(ws);
+                    console.log(`[tv_consumer] registrato (userKey=${key}, totali=${ch.consumers.size})`);
+                    ws.send(JSON.stringify({
+                        type: 'registered', role: 'tv_consumer', userKey: key,
+                        producer: ch.producer ? 'online' : 'offline'
+                    }));
+                    if (ch.producer && ch.producer.readyState === 1) {
+                        ch.producer.send(JSON.stringify({ type: 'peer_status', peer: 'consumer', status: 'online', total: ch.consumers.size }));
+                    }
+                    return;
+                }
+
+                console.warn(`[register] ruolo sconosciuto: ${msg.role}`);
                 return;
             }
 
-            // ─── Risposta fetch dal TM → resolve HTTP pending ───
+            // ═══════════════════════════════════════════════════════════
+            //  SCRAPER / FETCH (v10) — invariato
+            // ═══════════════════════════════════════════════════════════
+
+            // Risposta fetch dal TM → resolve HTTP pending
             if (ws._role === 'agent' && msg.type === 'fetch_response') {
                 const entry = fetchQueue.get(msg.id);
                 if (entry) {
@@ -197,14 +275,73 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
+            // ═══════════════════════════════════════════════════════════
+            //  TRADE — producer → consumers
+            // ═══════════════════════════════════════════════════════════
+            if (ws._role === 'adp_producer') {
+                const ch = tradeChannels.get(ws._userKey);
+                if (ch && (msg.type === 'trade' || msg.type === 'schema_sample' || msg.type === 'producer_log')) {
+                    let delivered = 0;
+                    ch.consumers.forEach(c => {
+                        if (c.readyState === 1) { c.send(JSON.stringify(msg)); delivered++; }
+                    });
+                    if (msg.type === 'trade') {
+                        console.log(`[trade] ${msg.event || '?'} ticket=${msg.trade?.ticket || '?'} → ${delivered} consumer(s)`);
+                    }
+                    return;
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════════
+            //  TRADE — consumer → producer
+            // ═══════════════════════════════════════════════════════════
+            if (ws._role === 'tv_consumer') {
+                const ch = tradeChannels.get(ws._userKey);
+                if (ch && (msg.type === 'trade_ack' || msg.type === 'dom_snapshot' || msg.type === 'consumer_log')) {
+                    if (ch.producer && ch.producer.readyState === 1) {
+                        ch.producer.send(JSON.stringify(msg));
+                    }
+                    if (msg.type === 'dom_snapshot') {
+                        console.log(`[dom_snapshot] userKey=${ws._userKey} (${JSON.stringify(msg).length}B)`);
+                    }
+                    return;
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════════
+            //  Ping/pong applicativo generico
+            // ═══════════════════════════════════════════════════════════
             if (msg.type === 'ping') { ws.send(JSON.stringify({ type: 'pong', ts: Date.now() })); return; }
 
         } catch (e) { console.error('[error]', e.message); }
     });
 
     ws.on('close', () => {
+        console.log(`[-] ${ws._role || '?'} disconnesso`);
+
+        // SCRAPER cleanup (v10)
         if (ws._role === 'agent') { agents.delete(ws); if (ws === activeAgent) activeAgent = null; }
         if (ws === bridge) bridge = null;
+
+        // TRADE cleanup (v11)
+        if (ws._role === 'adp_producer' || ws._role === 'tv_consumer') {
+            const key = ws._userKey;
+            const ch = tradeChannels.get(key);
+            if (ch) {
+                if (ws._role === 'adp_producer' && ch.producer === ws) {
+                    ch.producer = null;
+                    ch.consumers.forEach(c => {
+                        if (c.readyState === 1) c.send(JSON.stringify({ type: 'peer_status', peer: 'producer', status: 'offline' }));
+                    });
+                } else if (ws._role === 'tv_consumer') {
+                    ch.consumers.delete(ws);
+                    if (ch.producer && ch.producer.readyState === 1) {
+                        ch.producer.send(JSON.stringify({ type: 'peer_status', peer: 'consumer', status: 'offline', total: ch.consumers.size }));
+                    }
+                }
+                pruneChannel(key);
+            }
+        }
     });
 });
 
@@ -219,4 +356,4 @@ setInterval(() => {
 
 // ─── Start ───
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Scraper Bookmaker Relay v10 on :${PORT}`));
+server.listen(PORT, () => console.log(`Scraper Bookmaker Relay v11 on :${PORT}`));
